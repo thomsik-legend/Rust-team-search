@@ -3,7 +3,24 @@
 # Rust Match Bot – поиск напарников в игре Rust
 # --------------------------------------------------------------
 # Токен бота берётся из переменной окружения BOT_TOKEN.
-# Если переменная не задана, можно вписать токен вручную,
+## Критически важный фикс для Render
+import sys
+import types
+sys.modules['imghdr'] = types.ModuleType('fake_imghdr')
+sys.modules['imghdr'].what = lambda x: 'jpeg'  # Все изображения = JPEG
+
+# Остальной код
+import os
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters, CallbackContext
+import sqlite3
+from datetime import datetime
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("❌ BOT_TOKEN не задан!")
+
+# ... (весь остальной код бота без изменений) ... Если переменная не задана, можно вписать токен вручную,
 # но безопаснее хранить его в Settings → Variables.
 # --------------------------------------------------------------
 
