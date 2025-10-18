@@ -119,7 +119,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif step == 'level':
         context.user_data['level'] = text
-        save_user(user.id, user.first_name, text, context.user_data['bio'])
+        save_user(user.id, user.first_name, context.user_data['bio'], text)
         
         await update.message.reply_text(
             "✅ Отлично! Ты зарегистрирован!\n\n"
@@ -217,10 +217,4 @@ async def find_partner_after_action(query, context, user_id):
 # Просмотр профиля
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    profile_data = get_user_profile(user.id)
-    
-    if profile_data:
-        await update.message.reply_text(
-            f"📋 Твой профиль:\n\n"
-            f"📛 Имя: {profile_data[0]}\n"
-            f
+    profile_data = get_user_profile
