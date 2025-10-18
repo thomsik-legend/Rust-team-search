@@ -230,32 +230,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Готов начать?", reply_markup=reply_markup)
 
 # Поиск напарника
+# Поиск напарника (с приоритетом похожих)
 async def find_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    partner = get_random_user(user.id)
     
-    if not partner:
+    # Получаем профиль текущего пользователя
+    user_profile = get_user_profile(user.id)
+    if not user_profile:
+        await update.effective_message.reply_text("❌ Сначала заполните анкету!")
+        return
+
+    current_hours = user_profile[2]  # часы в Rust
+    current_age = user_profile[3]    # возраст
+
+    # Получаем всех других пользователей
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT telegram_id, name, hours, age, bio, username 
+        FROM users 
+        WHERE telegram_id != ?
+    ''', (user.id,))
+    all_partners = cursor.fetchall()
+    conn.close()
+
+    if not all_partners:
         await update.effective_message.reply_text("😢 Пока нет других участников")
         return
 
-    context.user_data['current_partner_id'] = partner[0]
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("❤️ Лайк", callback_data=f"like_{partner[0]}"),
-            InlineKeyboardButton("👎 Дизлайк", callback_data=f"dislike_{partner[0]}")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.effective_message.reply_text(
-        f"👤 Найден напарник:\n\n"
-        f"📛 Имя: {partner[1]}\n"
-        f"⏰ Часов в Rust: {partner[2]}\n"
-        f"🎂 Возраст: {partner[3]}\n"
-        f"💬 О себе: {partner[4]}",
-        reply_markup=reply_markup
-    )
+    # Сортируем по "близости": сначала по часам, потом по возрасту
+    def get_similarity(partner):
+        partner_id, name, hours, age, bio, username = partner
+        hours_diff = abs(hours - current_hours)
+        age_diff = abs(age - current_age)
+        # Веса: можно менять (например, часы важнее возраста)
+        return hours_diff * 1 + age_diff * 1  # чем меньше — тем ближе
+
+    sorted_partners = sorted(all_partners, key=get_similarity)
+
+    # Сохраняем список в user_data
+    context.user_data['partner_queue'] = [p[0] for p in sorted_partners]  # список telegram_id
+    context.user_data['current_partner_list'] = {p[0]: p for p in sorted_partners}  # полные данные
+
+    # Показываем первого
+    partner = sorted_partners[0]
+    await show_partner(update, context, partner)
 
 # Обработка лайка/дизлайка
 async def handle_like_dislike(query, context: ContextTypes.DEFAULT_TYPE):
@@ -281,29 +300,22 @@ async def handle_like_dislike(query, context: ContextTypes.DEFAULT_TYPE):
         await find_partner_after_action(query, context, user_id)
 
 # Автоматический поиск после действия
+# Автоматический поиск следующего напарника
 async def find_partner_after_action(query, context, user_id):
-    partner = get_random_user(user_id)
-    if not partner:
-        await context.bot.send_message(chat_id=user_id, text="😢 Больше нет участников")
+    queue = context.user_data.get('partner_queue', [])
+    
+    if not queue:
+        await context.bot.send_message(chat_id=user_id, text="🎉 Ты просмотрел всех напарников!")
         return
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("❤️ Лайк", callback_data=f"like_{partner[0]}"),
-            InlineKeyboardButton("👎 Дизлайк", callback_data=f"dislike_{partner[0]}")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await context.bot.send_message(
-        chat_id=user_id,
-        text=f"👤 Следующий напарник:\n\n"
-             f"📛 Имя: {partner[1]}\n"
-             f"⏰ Часов в Rust: {partner[2]}\n"
-             f"🎂 Возраст: {partner[3]}\n"
-             f"💬 О себе: {partner[4]}",
-        reply_markup=reply_markup
-    )
+
+    next_id = queue.pop(0)  # Берём следующего
+    context.user_data['partner_queue'] = queue
+
+    partner_data = context.user_data['current_partner_list'].get(next_id)
+    if partner_data:
+        await show_partner(query, context, partner_data)
+    else:
+        await find_partner_after_action(query, context, user_id)  # Рекурсия, если нет
 
 # Главная функция
 def main():
@@ -322,6 +334,27 @@ def main():
 
     logger.info("✅ Бот запущен!")
     app.run_polling()
+# Показать напарника
+async def show_partner(update: Update, context: ContextTypes.DEFAULT_TYPE, partner):
+    partner_id, name, hours, age, bio, username = partner
 
+    context.user_data['current_partner_id'] = partner_id
+
+    keyboard = [
+        [
+            InlineKeyboardButton("❤️ Лайк", callback_data=f"like_{partner_id}"),
+            InlineKeyboardButton("👎 Дизлайк", callback_data=f"dislike_{partner_id}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.effective_message.reply_text(
+        f"👤 Найден напарник:\n\n"
+        f"📛 Имя: {name}\n"
+        f"⏰ Часов в Rust: {hours}\n"
+        f"🎂 Возраст: {age}\n"
+        f"💬 О себе: {bio}",
+        reply_markup=reply_markup
+    )
 if __name__ == '__main__':
     main()
