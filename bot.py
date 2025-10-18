@@ -273,13 +273,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['step'] = None
 
 # Поиск напарника (с приоритетом похожих)
+# Поиск напарника (с приоритетом похожих)
 async def find_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    
+    # Определяем, откуда вызов: от команды или от кнопки
+    if hasattr(update, 'message'):
+        user = update.effective_user
+        chat_id = update.effective_chat.id
+    else:
+        # Это CallbackQuery
+        user = update.callback_query.from_user
+        chat_id = update.callback_query.message.chat_id
+
     # Получаем профиль текущего пользователя
     user_profile = get_user_profile(user.id)
     if not user_profile:
-        await update.effective_message.reply_text("❌ Сначала заполните анкету!")
+        await context.bot.send_message(chat_id=chat_id, text="❌ Сначала заполните анкету!")
         return
 
     current_hours = user_profile[2]
@@ -288,8 +296,24 @@ async def find_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Получаем всех других
     all_partners = get_all_partners(user.id)
     if not all_partners:
-        await update.effective_message.reply_text("😢 Пока нет других участников")
+        await context.bot.send_message(chat_id=chat_id, text="😢 Пока нет других участников")
         return
+
+    # Сортируем по близости
+    def similarity(partner):
+        _, _, hours, age, _, _ = partner
+        hours_diff = abs(hours - current_hours)
+        age_diff = abs(age - current_age)
+        return hours_diff + age_diff
+
+    sorted_partners = sorted(all_partners, key=similarity)
+
+    # Сохраняем очередь
+    context.user_data['partner_queue'] = [p[0] for p in sorted_partners]
+    context.user_data['current_partner_list'] = {p[0]: p for p in sorted_partners}
+
+    # Показываем первого
+    await show_partner(update, context, sorted_partners[0])
 
     # Сортируем по близости
     def similarity(partner):
@@ -308,6 +332,7 @@ async def find_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_partner(update, context, sorted_partners[0])
 
 # Показать напарника
+# Показать напарника
 async def show_partner(update: Update, context: ContextTypes.DEFAULT_TYPE, partner):
     partner_id, name, hours, age, bio, username = partner
 
@@ -321,15 +346,21 @@ async def show_partner(update: Update, context: ContextTypes.DEFAULT_TYPE, partn
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.effective_message.reply_text(
-        f"👤 Найден напарник:\n\n"
-        f"📛 Имя: {name}\n"
-        f"⏰ Часов в Rust: {hours}\n"
-        f"🎂 Возраст: {age}\n"
-        f"💬 О себе: {bio}",
+    # Определяем chat_id
+    if hasattr(update, 'message'):
+        chat_id = update.effective_chat.id
+    else:
+        chat_id = update.callback_query.message.chat_id
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"👤 Найден напарник:\n\n"
+             f"📛 Имя: {name}\n"
+             f"⏰ Часов в Rust: {hours}\n"
+             f"🎂 Возраст: {age}\n"
+             f"💬 О себе: {bio}",
         reply_markup=reply_markup
     )
-
 # Обработка лайка/дизлайка
 async def handle_like_dislike(query, context: ContextTypes.DEFAULT_TYPE):
     data = query.data.split('_')
@@ -354,6 +385,7 @@ async def handle_like_dislike(query, context: ContextTypes.DEFAULT_TYPE):
         await find_partner_after_action(query, context, user_id)
 
 # Автоматический поиск следующего
+# Автоматический поиск следующего напарника
 async def find_partner_after_action(query, context, user_id):
     queue = context.user_data.get('partner_queue', [])
     
@@ -366,7 +398,15 @@ async def find_partner_after_action(query, context, user_id):
 
     partner_data = context.user_data['current_partner_list'].get(next_id)
     if partner_data:
-        await show_partner(query, context, partner_data)
+        # Создаём dummy update, чтобы show_partner работал
+        class DummyUpdate:
+            def __init__(self, chat_id):
+                self.callback_query = None
+                self.effective_chat = type('Chat', (), {'id': chat_id})()
+                self.effective_user = None
+
+        dummy_update = DummyUpdate(user_id)
+        await show_partner(dummy_update, context, partner_data)
     else:
         await find_partner_after_action(query, context, user_id)
 
