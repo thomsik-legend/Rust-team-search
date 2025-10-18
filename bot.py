@@ -2,7 +2,7 @@ import os
 import logging
 import sqlite3
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters, ReplyKeyboardMarkup
 
 # Логирование
 logging.basicConfig(
@@ -21,8 +21,10 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             telegram_id INTEGER PRIMARY KEY,
             name TEXT,
+            hours INTEGER,
+            age INTEGER,
             bio TEXT,
-            level TEXT,
+            username TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -40,22 +42,40 @@ def init_db():
     conn.close()
 
 # Сохранение пользователя
-def save_user(telegram_id, name, bio, level):
+def save_user(telegram_id, name, hours, age, bio, username):
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT OR REPLACE INTO users (telegram_id, name, bio, level)
-        VALUES (?, ?, ?, ?)
-    ''', (telegram_id, name, bio, level))
+        INSERT OR REPLACE INTO users (telegram_id, name, hours, age, bio, username)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (telegram_id, name, hours, age, bio, username))
     conn.commit()
     conn.close()
+
+# Проверка, заполнена ли анкета
+def is_profile_complete(telegram_id):
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT 1 FROM users WHERE telegram_id = ?', (telegram_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None
+
+# Получить профиль
+def get_user_profile(telegram_id):
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT name, hours, age, bio, username FROM users WHERE telegram_id = ?', (telegram_id,))
+    user = cursor.fetchone()
+    conn.close()
+    return user
 
 # Получить случайного пользователя
 def get_random_user(exclude_id):
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT telegram_id, name, bio, level FROM users
+        SELECT telegram_id, name, hours, age, bio, username FROM users
         WHERE telegram_id != ?
         ORDER BY RANDOM() LIMIT 1
     ''', (exclude_id,))
@@ -67,11 +87,8 @@ def get_random_user(exclude_id):
 def is_match(user_id, partner_id):
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
-    
-    # Проверяем, лайкнул ли partner user_id
     cursor.execute('SELECT 1 FROM likes WHERE from_id = ? AND to_id = ?', (partner_id, user_id))
     liked_back = cursor.fetchone() is not None
-    
     conn.close()
     return liked_back
 
@@ -80,26 +97,91 @@ def add_like(from_id, to_id):
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
     cursor.execute('INSERT OR IGNORE INTO likes (from_id, to_id) VALUES (?, ?)', (from_id, to_id))
+    
+    # Проверяем, есть ли матч
+    cursor.execute('SELECT 1 FROM likes WHERE from_id = ? AND to_id = ?', (to_id, from_id))
+    is_match_found = cursor.fetchone() is not None
+    
     conn.commit()
     conn.close()
+    
+    return is_match_found
 
-# Получить профиль по ID
-def get_user_profile(telegram_id):
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT name, bio, level FROM users WHERE telegram_id = ?', (telegram_id,))
-    user = cursor.fetchone()
-    conn.close()
-    return user
+# Отправка уведомления о лайке
+async def notify_user_about_like(context: ContextTypes.DEFAULT_TYPE, to_user_id, liker_name):
+    try:
+        await context.bot.send_message(
+            chat_id=to_user_id,
+            text=f"❤️ Кто-то поставил лайк твоей анкете!\n"
+                 f"Это {liker_name} — посмотри и ты!"
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось отправить уведомление {to_user_id}: {e}")
+
+# Отправка уведомления о матче
+async def notify_users_about_match(context: ContextTypes.DEFAULT_TYPE, user_id, partner_id):
+    user_profile = get_user_profile(user_id)
+    partner_profile = get_user_profile(partner_id)
+    
+    if not user_profile or not partner_profile:
+        return
+
+    name1, _, _, _, username1 = user_profile
+    name2, _, _, _, username2 = partner_profile
+
+    link1 = f"@{username1}" if username1 else "неизвестен"
+    link2 = f"@{username2}" if username2 else "неизвестен"
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"🎉 УРА! У вас МАТЧ!\n\n"
+                 f"🔥 Напарник: {name2}\n"
+                 f"💬 {link2}\n\n"
+                 f"Напишите друг другу!"
+        )
+    except Exception as e:
+        logger.warning(f"Ошибка при отправке матча {user_id}: {e}")
+
+    try:
+        await context.bot.send_message(
+            chat_id=partner_id,
+            text=f"🎉 УРА! У вас МАТЧ!\n\n"
+                 f"🔥 Напарник: {name1}\n"
+                 f"💬 {link1}\n\n"
+                 f"Напишите друг другу!"
+        )
+    except Exception as e:
+        logger.warning(f"Ошибка при отправке матча {partner_id}: {e}")
 
 # Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    keyboard = [[InlineKeyboardButton("🔍 Найти напарника по Rust", callback_data="find_partner")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await update.message.reply_text(
-        f"👋 Привет, {user.first_name}! Я помогу найти тебе напарника по Rust.\n\n"
-        "Напиши, кто ты (например: изучаю Rust, ищу напарника для проектов):"
+        f"👋 Привет, {user.first_name}! Я помогу найти тебе напарника по Rust.",
+        reply_markup=reply_markup
     )
-    context.user_data['step'] = 'bio'
+
+# Обработка кнопки
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "find_partner":
+        if not is_profile_complete(query.from_user.id):
+            await query.message.reply_text(
+                "📝 Сначала нужно создать анкету!\n\n"
+                "Сколько часов ты уже откатал в Rust?"
+            )
+            context.user_data['step'] = 'hours'
+        else:
+            await find_partner(update, context)
+    
+    elif query.data.startswith("like_") or query.data.startswith("dislike_"):
+        await handle_like_dislike(query, context)
 
 # Обработка сообщений
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -107,27 +189,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     step = context.user_data.get('step')
 
-    if step == 'bio':
-        context.user_data['bio'] = text
-        await update.message.reply_text(
-            "🎯 Укажи свой уровень знаний Rust:\n"
-            "• Новичок\n"
-            "• Средний\n"
-            "• Эксперт"
-        )
-        context.user_data['step'] = 'level'
+    if step == 'hours':
+        try:
+            hours = int(text)
+            if hours < 0:
+                raise ValueError()
+            context.user_data['hours'] = hours
+            await update.message.reply_text("📅 Укажи свой возраст:")
+            context.user_data['step'] = 'age'
+        except:
+            await update.message.reply_text("Введите число (например: 50)")
     
-    elif step == 'level':
-        context.user_data['level'] = text
-        save_user(user.id, user.first_name, context.user_data['bio'], text)
+    elif step == 'age':
+        try:
+            age = int(text)
+            if age < 10 or age > 100:
+                raise ValueError()
+            context.user_data['age'] = age
+            await update.message.reply_text("💬 Напиши что-нибудь о себе (о своих целях, стиле игры и т.д.):")
+            context.user_data['step'] = 'bio'
+        except:
+            await update.message.reply_text("Введите возраст (например: 25)")
+    
+    elif step == 'bio':
+        context.user_data['bio'] = text
+        user_data = context.user_data
         
-        await update.message.reply_text(
-            "✅ Отлично! Ты зарегистрирован!\n\n"
-            "Команды:\n"
-            "/find - найти напарника\n"
-            "/profile - посмотреть профиль"
+        save_user(
+            user.id, user.first_name,
+            user_data['hours'], user_data['age'],
+            user_data['bio'], user.username
         )
+        
+        await update.message.reply_text("✅ Анкета готова! Теперь ты можешь искать напарников.")
         context.user_data['step'] = None
+        
+        # Показать кнопку поиска
+        keyboard = [[InlineKeyboardButton("🔍 Найти напарника", callback_data="find_partner")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Готов начать?", reply_markup=reply_markup)
 
 # Поиск напарника
 async def find_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -135,7 +235,7 @@ async def find_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     partner = get_random_user(user.id)
     
     if not partner:
-        await update.message.reply_text("😢 Пока нет других участников")
+        await update.effective_message.reply_text("😢 Пока нет других участников")
         return
 
     context.user_data['current_partner_id'] = partner[0]
@@ -148,42 +248,32 @@ async def find_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"👤 Найден напарник:\n\n"
         f"📛 Имя: {partner[1]}\n"
-        f"📖 О себе: {partner[2]}\n"
-        f"🔧 Уровень: {partner[3]}",
+        f"⏰ Часов в Rust: {partner[2]}\n"
+        f"🎂 Возраст: {partner[3]}\n"
+        f"💬 О себе: {partner[4]}",
         reply_markup=reply_markup
     )
 
-# Обработка кнопок
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
+# Обработка лайка/дизлайка
+async def handle_like_dislike(query, context: ContextTypes.DEFAULT_TYPE):
     data = query.data.split('_')
     action = data[0]
     partner_id = int(data[1])
     user_id = query.from_user.id
-    
+    user_name = query.from_user.first_name
+
     if action == 'like':
-        add_like(user_id, partner_id)
+        is_match_found = add_like(user_id, partner_id)
         
-        # Проверка на матч
-        if is_match(user_id, partner_id):
-            partner_profile = get_user_profile(partner_id)
-            if partner_profile:
-                await query.edit_message_text(
-                    f"🎉 УРА! У вас МАТЧ!\n\n"
-                    f"🔥 Напарник: {partner_profile[0]}\n"
-                    f"💬 {partner_profile[1]}\n"
-                    f"🎯 Уровень: {partner_profile[2]}\n\n"
-                    f"🔗 Написать ему: t.me/{query.from_user.username or 'username_not_set'}"
-                )
-            else:
-                await query.edit_message_text("🎉 У вас матч! Но профиль недоступен.")
+        if is_match_found:
+            await query.edit_message_text("🎉 У вас ВЗАИМНЫЙ МАТЧ! Оба уведомлены.")
+            await notify_users_about_match(context, user_id, partner_id)
         else:
             await query.edit_message_text("❤️ Ты поставил лайк! Ищем дальше...")
+            await notify_user_about_like(context, partner_id, user_name)
             await find_partner_after_action(query, context, user_id)
     
     elif action == 'dislike':
@@ -209,25 +299,11 @@ async def find_partner_after_action(query, context, user_id):
         chat_id=user_id,
         text=f"👤 Следующий напарник:\n\n"
              f"📛 Имя: {partner[1]}\n"
-             f"📖 О себе: {partner[2]}\n"
-             f"🔧 Уровень: {partner[3]}",
+             f"⏰ Часов в Rust: {partner[2]}\n"
+             f"🎂 Возраст: {partner[3]}\n"
+             f"💬 О себе: {partner[4]}",
         reply_markup=reply_markup
     )
-
-# Просмотр профиля
-async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    profile_data = get_user_profile(user.id)
-    
-    if profile_data:
-        await update.message.reply_text(
-            f"📋 Твой профиль:\n\n"
-            f"📛 Имя: {profile_data[0]}\n"
-            f"📖 О себе: {profile_data[1]}\n"
-            f"🔧 Уровень: {profile_data[2]}"
-        )
-    else:
-        await update.message.reply_text("Ты не зарегистрирован. Напиши /start")
 
 # Главная функция
 def main():
@@ -241,10 +317,8 @@ def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("find", find_partner))
-    app.add_handler(CommandHandler("profile", profile))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("✅ Бот запущен!")
     app.run_polling()
