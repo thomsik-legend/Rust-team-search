@@ -581,8 +581,41 @@ async def handle_text_and_buttons(update: Update, context: ContextTypes.DEFAULT_
         return
 
     text = update.message.text.strip()
-    step = context.user_data.get("step")
     user = update.effective_user
+
+    # ПРОВЕРЯЕМ: есть ли у пользователя анкета?
+    profile = get_user_profile(user.id)
+
+    # ЕСЛИ АНКЕТА ЕСТЬ — обрабатываем команды меню, игнорируя шаги
+    if profile:
+        context.user_data["step"] = None  # Сбрасываем шаг, чтобы не мешал
+
+        if text == "🔍 Найти напарника":
+            await find_partner(update, context)
+        elif text == "🔄 Обновить анкету":
+            await start_profile(update, context)
+        elif text == "👤 Профиль":
+            await profile_command(update, context)
+        elif text == "📊 Статистика":
+            await stats_command(update, context)
+        elif text == "❤️ Посмотреть лайки":
+            await show_likes_command(update, context)
+        elif text == "🔕 Скрыть анкету":
+            deactivate_user(user.id)
+            await update.message.reply_text(
+                "❌ Ваша анкета скрыта из поиска.", reply_markup=main_keyboard()
+            )
+        else:
+            await update.message.reply_text(
+                "Не понял. Выберите действие из меню.", reply_markup=main_keyboard()
+            )
+        return  # ВЫХОДИМ — дальше не идём
+
+    # ЕСЛИ АНКЕТЫ НЕТ — работаем по шагам
+    step = context.user_data.get("step")
+
+    if step == "choose_method":
+        # ... (оставь как есть)
 
     # ==============================
     # 1️⃣ ШАГИ СОЗДАНИЯ/ОБНОВЛЕНИЯ
