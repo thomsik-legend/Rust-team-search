@@ -44,9 +44,16 @@ logger = logging.getLogger(__name__)
 class RateLimiter:
     def __init__(self):
         self.requests = {}
+        self.last_cleanup = datetime.now()
     
     def check_limit(self, user_id, action, limit=5, period=60):
         now = datetime.now()
+        
+        # Автоочистка старых запросов каждые 10 минут
+        if (now - self.last_cleanup) > timedelta(minutes=10):
+            self.cleanup_old_requests()
+            self.last_cleanup = now
+        
         key = f"{user_id}_{action}"
         
         if key not in self.requests:
@@ -60,8 +67,25 @@ class RateLimiter:
         
         self.requests[key].append(now)
         return True
-
-limiter = RateLimiter()
+    
+    def cleanup_old_requests(self):
+        """Очищает запросы старше 1 часа"""
+        now = datetime.now()
+        keys_to_remove = []
+        
+        for key, timestamps in self.requests.items():
+            # Оставляем только свежие запросы (менее 1 часа)
+            fresh_timestamps = [t for t in timestamps if (now - t) < timedelta(hours=1)]
+            if fresh_timestamps:
+                self.requests[key] = fresh_timestamps
+            else:
+                keys_to_remove.append(key)
+        
+        # Удаляем полностью пустые ключи
+        for key in keys_to_remove:
+            del self.requests[key]
+        
+        logger.info(f"RateLimiter cleanup: removed {len(keys_to_remove)} old keys")
 
 # ───────────────────────────────────────
 #   МЕНЕДЖЕР БАЗЫ ДАННЫХ
@@ -158,17 +182,22 @@ def init_db() -> None:
         )
 
 # ───────────────────────────────────────
-#   ВАЛИДАЦИЯ
+#   ВАЛИДАЦИА
 # ───────────────────────────────────────
 def validate_steam_id(steam_id):
     """Проверка корректности Steam ID"""
-    if not isinstance(steam_id, (int, str)):
+    try:
+        # Преобразуем в число
+        if isinstance(steam_id, str):
+            if not steam_id.isdigit():
+                return False
+            steam_id = int(steam_id)
+        
+        # Проверяем диапазон Steam ID (SteamID64)
+        return 76561197960265728 <= steam_id <= 76561197960265728 + 2**32
+        
+    except (ValueError, TypeError):
         return False
-    if isinstance(steam_id, str) and not steam_id.isdigit():
-        return False
-    steam_id = int(steam_id)
-    # Проверяем диапазон Steam ID
-    return 76561197960265728 <= steam_id <= 76561197960265728 + 2**32
 
 def validate_hours(hours):
     """Проверка корректности часов"""
@@ -247,6 +276,12 @@ def add_like(cur, from_id, to_id):
         "INSERT OR IGNORE INTO likes (from_id, to_id) VALUES (?, ?)",
         (from_id, to_id),
     )
+    logger.info(f"Like added: from {from_id} to {to_id}")
+def add_like(cur, from_id, to_id):
+    cur.execute(
+        "INSERT OR IGNORE INTO likes (from_id, to_id) VALUES (?, ?)",
+        (from_id, to_id),
+    )
     cur.execute(
         "SELECT 1 FROM likes WHERE from_id = ? AND to_id = ?", (to_id, from_id)
     )
@@ -282,6 +317,13 @@ def add_report(cur, reporter_id, reported_id):
         "INSERT OR IGNORE INTO reports (reporter_id, reported_id) VALUES (?, ?)",
         (reporter_id, reported_id),
     )
+    @safe_db_execute
+def add_report(cur, reporter_id, reported_id):
+    cur.execute(
+        "INSERT OR IGNORE INTO reports (reporter_id, reported_id) VALUES (?, ?)",
+        (reporter_id, reported_id),
+    )
+    logger.info(f"Report added: {reporter_id} reported {reported_id}")
 
 @safe_db_execute
 def deactivate_user(cur, tg_id):
@@ -299,6 +341,7 @@ def ban_user_temporarily(cur, user_id, days=5):
         (user_id, banned_until.isoformat()),
     )
     deactivate_user(user_id)
+    logger.warning(f"User {user_id} banned for {days} days")
 
 @safe_db_execute
 def unban_user(cur, user_id):
@@ -350,8 +393,14 @@ def update_stat(cur, user_id, field):
         return
     
     cur.execute("INSERT OR IGNORE INTO stats (user_id) VALUES (?)", (user_id,))
-    cur.execute(f"UPDATE stats SET {field} = {field} + 1 WHERE user_id = ?", (user_id,))
-
+    
+    # БЕЗОПАСНЫЙ подход вместо f-строк
+    if field == "viewed_profiles":
+        cur.execute("UPDATE stats SET viewed_profiles = viewed_profiles + 1 WHERE user_id = ?", (user_id,))
+    elif field == "likes_given":
+        cur.execute("UPDATE stats SET likes_given = likes_given + 1 WHERE user_id = ?", (user_id,))
+    elif field == "matches":
+        cur.execute("UPDATE stats SET matches = matches + 1 WHERE user_id = ?", (user_id,))
 @safe_db_execute
 def get_stats(cur, user_id):
     cur.execute(
@@ -484,9 +533,6 @@ async def ask_to_subscribe(update: Update):
 # ───────────────────────────────────────
 #   ДЕКОРАТОР ДЛЯ ПРОВЕРКИ ПОДПИСКИ
 # ───────────────────────────────────────
-# ───────────────────────────────────────
-#   ДЕКОРАТОР ДЛЯ ПРОВЕРКИ ПОДПИСКИ (УЛУЧШЕННЫЙ)
-# ───────────────────────────────────────
 def subscription_required(func):
     """Декоратор для проверки подписки перед выполнением функции"""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -533,18 +579,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"⏳ Вы временно ограничены в использовании бота до {dt.strftime('%d.%m %H:%M')}.\n"
             "Спасибо за понимание.",
-            reply_markup=ReplyKeyboardMarkup([[
-                KeyboardButton("ℹ️ Помощь")
-            ]], resize_keyboard=True)
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("ℹ️ Помощь")]], resize_keyboard=True)
         )
         return
     
+    # 🧾 Если профиль уже есть — показываем меню
     if get_user_profile(user.id):
         await update.message.reply_text(
             f"👋 С возвращением, {user.first_name}!", reply_markup=main_keyboard()
         )
         return
 
+    # 🧩 Если профиля нет — начинаем создание
     await update.message.reply_text(
         f"👋 Привет, {user.first_name}! Давай создадим профиль.\n"
         "Как указать часы в Rust?",
@@ -576,19 +622,25 @@ async def start_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── ОБРАБОТКА ТЕКСТОВ И ШАГОВ АНКЕТЫ ──
 @subscription_required
-async def handle_text_and_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message is None:
+# 🔒 ПРОВЕРКА ПОДПИСКИ
+    if not await check_subscription(user.id, context):
+        await ask_to_subscribe(update)
         return
 
-    text = update.message.text.strip()
-    user = update.effective_user
-
-    # ПРОВЕРЯЕМ: есть ли у пользователя анкета?
+    # 🔍 Проверяем, есть ли у пользователя анкета
     profile = get_user_profile(user.id)
 
-    # ЕСЛИ АНКЕТА ЕСТЬ — обрабатываем команды меню, игнорируя шаги
+    # ✅ Если анкета существует — обрабатываем команды меню
     if profile:
-        context.user_data["step"] = None  # Сбрасываем шаг, чтобы не мешал
+        # ... остальной код без изменений ...
+
+    # 🔍 Проверяем, есть ли у пользователя анкета
+    profile = get_user_profile(user.id)
+
+    # ✅ Если анкета существует — обрабатываем команды меню
+    if profile:
+        # ⚠️ Сбрасываем шаг, чтобы не мешал
+        context.user_data["step"] = None
 
         if text == "🔍 Найти напарника":
             await find_partner(update, context)
@@ -609,19 +661,14 @@ async def handle_text_and_buttons(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text(
                 "Не понял. Выберите действие из меню.", reply_markup=main_keyboard()
             )
-        return  # ВЫХОДИМ — дальше не идём
+        return
 
-    # ЕСЛИ АНКЕТЫ НЕТ — работаем по шагам
+    # ❌ Если анкеты нет — работаем по шагам
     step = context.user_data.get("step")
 
+    # 🧩 ШАГ 1: Выбор метода (Steam или вручную)
     if step == "choose_method":
-        # ... (оставь как есть)
-
-    # ==============================
-    # 1️⃣ ШАГИ СОЗДАНИЯ/ОБНОВЛЕНИЯ
-    # ==============================
-    if step == "choose_method":
-        if text.isdigit() and len(text) > 5:            # скорее всего Steam‑ID
+        if text.isdigit() and len(text) > 5:  # Вероятно, это Steam ID
             result = verify_user_steam(user.id, text)
             if isinstance(result, int):
                 await update.message.reply_text(
@@ -648,6 +695,7 @@ async def handle_text_and_buttons(update: Update, context: ContextTypes.DEFAULT_
             )
             return
 
+    # 🧩 ШАГ 2: Ввод часов вручную
     if step == "hours_manual":
         try:
             hours = int(text)
@@ -661,6 +709,7 @@ async def handle_text_and_buttons(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("Введите число, например: 150")
         return
 
+    # 🧩 ШАГ 3: Возраст
     if step == "age":
         try:
             age = int(text)
@@ -674,6 +723,7 @@ async def handle_text_and_buttons(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("Введите число, например: 25")
         return
 
+    # 🧩 ШАГ 4: Био
     if step == "bio":
         if not validate_bio(text):
             await update.message.reply_text("Текст должен быть от 5 до 500 символов.")
@@ -691,31 +741,20 @@ async def handle_text_and_buttons(update: Update, context: ContextTypes.DEFAULT_
             "✅ Профиль сохранён! Теперь можно искать напарников.",
             reply_markup=main_keyboard(),
         )
+        # 🧼 Сбрасываем шаг
         context.user_data["step"] = None
         return
 
-    # ==============================
-    # 2️⃣ ОБРАБОТКА КНОПОК МЕНЮ
-    # ==============================
-    if text == "🔍 Найти напарника":
-        await find_partner(update, context)
-    elif text == "🔄 Обновить анкету":
+    # ❓ Если шаг не задан — начинаем создание анкеты
+    if step is None:
         await start_profile(update, context)
-    elif text == "👤 Профиль":
-        await profile_command(update, context)
-    elif text == "📊 Статистика":
-        await stats_command(update, context)
-    elif text == "❤️ Посмотреть лайки":
-        await show_likes_command(update, context)
-    elif text == "🔕 Скрыть анкету":
-        deactivate_user(user.id)
-        await update.message.reply_text(
-            "❌ Ваша анкета скрыта из поиска.", reply_markup=main_keyboard()
-        )
-    else:
-        await update.message.reply_text(
-            "Не понял. Выберите действие из меню.", reply_markup=main_keyboard()
-        )
+        return
+
+    # 🧨 Если что-то пошло не так
+    await update.message.reply_text(
+        "❌ Что-то пошло не так. Начните заново: /start",
+        reply_markup=main_keyboard(),
+    )
 
 # ── ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ ──
 @subscription_required
@@ -729,9 +768,7 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"⏳ Вы временно ограничены в использовании бота до {dt.strftime('%d.%m %H:%M')}.\n"
             "Спасибо за понимание.",
-            reply_markup=ReplyKeyboardMarkup([[
-                KeyboardButton("ℹ️ Помощь")
-            ]], resize_keyboard=True)
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("ℹ️ Помощь")]], resize_keyboard=True)
         )
         return
     
@@ -797,9 +834,7 @@ async def find_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"⏳ Вы временно ограничены в использовании бота до {dt.strftime('%d.%m %H:%M')}.\n"
             "Спасибо за понимание.",
-            reply_markup=ReplyKeyboardMarkup([[
-                KeyboardButton("ℹ️ Помощь")
-            ]], resize_keyboard=True)
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("ℹ️ Помощь")]], resize_keyboard=True)
         )
         return
 
@@ -913,7 +948,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("👎 Вы поставили дизлайк. Ищем следующего…")
             await next_partner(query.message.chat_id, context, user_id)
 
-    # ---------- ОТВЕТ НА ПРИХОДЯЩИЙ ЛАЙК ----------
+       # ---------- ОТВЕТ НА ПРИХОДЯЩИЙ ЛАЙК ----------
     elif action == "respond":
         resp_type = data[1]          # like / dislike
         from_id = int(data[2])       # кто лайкнул вас
@@ -963,9 +998,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_reports_for(target_id)
         await query.edit_message_text(
             f"🗑️ Жалобы на пользователя {target_id} сняты.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⬅️ Назад", callback_data="admin_back_to_reports")
-            ]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_back_to_reports")]])
         )
 
     elif action == "admin_ban_5d":
@@ -987,9 +1020,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"⏳ Пользователь {target_id} заблокирован до {dt.strftime('%d.%m %H:%M')}.\n"
             "Жалобы сняты.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔓 Принудительно разблокировать", callback_data=f"admin_unban_{target_id}")
-            ]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔓 Принудительно разблокировать", callback_data=f"admin_unban_{target_id}")]])
         )
         clear_reports_for(target_id)
 
@@ -1008,9 +1039,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         await query.edit_message_text(
             f"🔓 Пользователь {target_id} разблокирован вручную.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⬅️ Назад", callback_data="admin_back_to_reports")
-            ]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_back_to_reports")]])
         )
 
     elif action == "admin_back_to_reports":
@@ -1129,9 +1158,7 @@ async def show_likes_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(
             f"⏳ Вы временно ограничены в использовании бота до {dt.strftime('%d.%m %H:%M')}.\n"
             "Спасибо за понимание.",
-            reply_markup=ReplyKeyboardMarkup([[
-                KeyboardButton("ℹ️ Помощь")
-            ]], resize_keyboard=True)
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("ℹ️ Помощь")]], resize_keyboard=True)
         )
         return
     
@@ -1269,7 +1296,61 @@ async def reports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=markup,
         )
-
+async def handle_steam_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик callback-кнопок Steam"""
+    query = update.callback_query
+    if not query:
+        return
+        
+    await query.answer()
+    user = query.from_user
+    
+    if query.data == "link_steam":
+        await query.edit_message_text(
+            "🔗 *Привязка Steam аккаунта*\n\n"
+            "Отправьте ваш Steam ID (только цифры):\n"
+            "Пример: 76561198000000000\n\n"
+            "❓ Как найти Steam ID? Нажмите кнопку ниже:",
+            parse_mode="Markdown",
+            reply_markup=steam_help_keyboard()
+        )
+        context.user_data["step"] = "waiting_steam_id"
+        
+    elif query.data == "manual_hours":
+        await query.edit_message_text(
+            "✍️ *Ввод часов вручную*\n\n"
+            "Сколько часов вы играли в Rust?\n"
+            "Введите число (от 0 до 20000):",
+            parse_mode="Markdown"
+        )
+        context.user_data["step"] = "hours_manual"
+        
+    elif query.data == "steam_help":
+        help_text = (
+            "🎮 *Как найти ваш Steam ID:*\n\n"
+            "1. Откройте Steam клиент\n"
+            "2. Перейдите в свой профиль\n"
+            "3. Скопируйте цифры из адресной строки\n"
+            "Пример: https://steamcommunity.com/profiles/76561198000000000\n"
+            "Ваш Steam ID: 76561198000000000\n\n"
+            "Или:\n"
+            "1. Откройте свой профиль в Steam\n"
+            "2. Нажмите \"Копировать профиль URL\"\n"
+            "3. Вставьте в любом текстовом редакторе\n"
+            "4. Извлеките цифры после /profiles/"
+        )
+        await query.edit_message_text(
+            help_text, 
+            parse_mode="Markdown", 
+            reply_markup=steam_help_keyboard()
+        )
+        
+    elif query.data == "back_to_hours":
+        await query.edit_message_text(
+            "Сколько часов ты откатал в Rust?", 
+            reply_markup=steam_keyboard()
+        )
+        context.user_data["step"] = "choose_method"
 # ── АДМИН: БЛОКИРОВКА/РАЗБЛОКИРОВКА ЧЕРЕЗ ТЕКСТОВЫЕ КОМАНДЫ ──
 @admin_only
 async def block_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1347,16 +1428,22 @@ t.start()
 # ───────────────────────────────────────
 #   ЗАПУСК БОТА
 # ───────────────────────────────────────
-# ───────────────────────────────────────
-#   ЗАПУСК БОТА
-# ───────────────────────────────────────
 def main():
     init_db()
     TOKEN = os.getenv("TELEGRAM_TOKEN")
     if not TOKEN:
         logger.error("❌ Не найден токен в переменной TELEGRAM_TOKEN")
         return
-
+    # ... остальной код ...
+    
+    # Добавьте этот обработчик ПЕРЕД основным обработчиком callback
+    app.add_handler(CallbackQueryHandler(handle_steam_callbacks, pattern="^(link_steam|manual_hours|steam_help|back_to_hours)"))
+    
+    # Остальные обработчики...
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(CallbackQueryHandler(pagination_callback, pattern="^(prev|next)_"))
+    
+    # ... остальной код ...
     # Добавляем задержку, чтобы избежать конфликта с предыдущим экземпляром
     logger.info("⏳ Ожидание 10 секунд перед запуском бота...")
     time.sleep(10)
