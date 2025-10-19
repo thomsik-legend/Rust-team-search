@@ -26,7 +26,7 @@ DB_NAME = "users.db"
 REQUIRED_CHANNEL = "@rustycave"
 STEAM_API_KEY = os.getenv("STEAM_API_KEY", "")  # Получите здесь: https://steamcommunity.com/dev/apikey
 
-# ID администратора
+# ID администратора - ЗАМЕНИТЕ НА СВОЙ ID
 ADMIN_IDS = {904487148}
 
 # ───────────────────────────────────────
@@ -139,17 +139,19 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS reports (
                 reporter_id INTEGER,
                 reported_id INTEGER,
-                reported_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                reported_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(reporter_id, reported_id)
             )
             """
         )
 
-        # Таблица заблокированных пользователей
+        # Таблица временных банов
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS blocked_users (
+            CREATE TABLE IF NOT EXISTS temp_bans (
                 user_id INTEGER PRIMARY KEY,
-                blocked INTEGER DEFAULT 1
+                banned_until TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
@@ -226,12 +228,12 @@ def get_all_active_partners(cur, exclude_id):
         """
         SELECT u.telegram_id, u.name, u.hours, u.age, u.bio, u.username, u.is_verified
         FROM users u
-        LEFT JOIN blocked_users b ON u.telegram_id = b.user_id
+        LEFT JOIN temp_bans b ON u.telegram_id = b.user_id
         WHERE u.telegram_id != ?
           AND u.is_active = 1
-          AND (b.blocked IS NULL OR b.blocked = 0)
+          AND (b.banned_until IS NULL OR b.banned_until < ?)
         """,
-        (exclude_id,),
+        (exclude_id, datetime.now().isoformat()),
     )
     return cur.fetchall()
 
@@ -276,7 +278,7 @@ def remove_pending_like(cur, from_id, to_id):
 @safe_db_execute
 def add_report(cur, reporter_id, reported_id):
     cur.execute(
-        "INSERT INTO reports (reporter_id, reported_id) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO reports (reporter_id, reported_id) VALUES (?, ?)",
         (reporter_id, reported_id),
     )
 
@@ -289,26 +291,35 @@ def activate_user(cur, tg_id):
     cur.execute("UPDATE users SET is_active = 1 WHERE telegram_id = ?", (tg_id,))
 
 @safe_db_execute
-def block_user(cur, tg_id):
-    """Поместить пользователя в чёрный список."""
+def ban_user_temporarily(cur, user_id, days=5):
+    banned_until = datetime.now() + timedelta(days=days)
     cur.execute(
-        "INSERT OR REPLACE INTO blocked_users (user_id, blocked) VALUES (?, 1)",
-        (tg_id,),
+        "INSERT OR REPLACE INTO temp_bans (user_id, banned_until) VALUES (?, ?)",
+        (user_id, banned_until.isoformat()),
     )
+    deactivate_user(user_id)
 
 @safe_db_execute
-def unblock_user(cur, tg_id):
-    """Снять блокировку."""
-    cur.execute(
-        "UPDATE blocked_users SET blocked = 0 WHERE user_id = ?", (tg_id,)
-    )
+def unban_user(cur, user_id):
+    cur.execute("DELETE FROM temp_bans WHERE user_id = ?", (user_id,))
+    activate_user(user_id)
 
 @safe_db_execute
-def get_blocked_list(cur):
-    """Список всех заблокированных ID."""
-    cur.execute("SELECT user_id FROM blocked_users WHERE blocked = 1")
-    rows = cur.fetchall()
-    return [r[0] for r in rows] if rows else []
+def is_user_banned(cur, user_id):
+    cur.execute(
+        "SELECT banned_until FROM temp_bans WHERE user_id = ? AND banned_until > ?",
+        (user_id, datetime.now().isoformat()),
+    )
+    return cur.fetchone() is not None
+
+@safe_db_execute
+def get_banned_until(cur, user_id):
+    cur.execute(
+        "SELECT banned_until FROM temp_bans WHERE user_id = ?",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
 
 @safe_db_execute
 def clear_reports_for(cur, user_id):
@@ -444,6 +455,12 @@ def subscribe_keyboard():
         [InlineKeyboardButton("🔄 Проверить подписку", callback_data="check_subscription")],
     ])
 
+def restart_search_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Начать сначала", callback_data="restart_search")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+    ])
+
 # ───────────────────────────────────────
 #   ПРОВЕРКА ПОДПИСКИ
 # ───────────────────────────────────────
@@ -499,6 +516,20 @@ def admin_only(func):
 @subscription_required
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    
+    # Проверка на временный бан
+    if is_user_banned(user.id):
+        banned_until = get_banned_until(user.id)
+        dt = datetime.fromisoformat(banned_until)
+        await update.message.reply_text(
+            f"⏳ Вы временно ограничены в использовании бота до {dt.strftime('%d.%m %H:%M')}.\n"
+            "Спасибо за понимание.",
+            reply_markup=ReplyKeyboardMarkup([[
+                KeyboardButton("ℹ️ Помощь")
+            ]], resize_keyboard=True)
+        )
+        return
+    
     if get_user_profile(user.id):
         await update.message.reply_text(
             f"👋 С возвращением, {user.first_name}!", reply_markup=main_keyboard()
@@ -517,14 +548,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ℹ️ *Помощь*\n\n"
         "• 🔍 *Найти напарника* — начать поиск.\n"
         "• 🔄 *Обновить анкету* — изменить данные.\n"
-        "• 👤 *Прфиль* — посмотреть свою анкету.\n"
+        "• 👤 *Профиль* — посмотреть свою анкету.\n"
         "• 📊 *Статистика* — ваша активность.\n"
         "• ❤️ *Посмотреть лайки* — кто вас лайкнул.\n"
         "• 🔕 *Скрыть анкету* — чтобы вас не показывали.\n\n"
         "🔧 **Команды для администратора:**\n"
-        "`/reports` — список анкет с жалобами.\n"
-        "`/block <id>` — заблокировать пользователя.\n"
-        "`/unblock <id>` — снять блокировку.\n",
+        "`/reports` — список анкет с жалобами.\n",
         parse_mode="Markdown",
         reply_markup=main_keyboard(),
     )
@@ -650,6 +679,20 @@ async def handle_text_and_buttons(update: Update, context: ContextTypes.DEFAULT_
 @subscription_required
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    
+    # Проверка на временный бан
+    if is_user_banned(user.id):
+        banned_until = get_banned_until(user.id)
+        dt = datetime.fromisoformat(banned_until)
+        await update.message.reply_text(
+            f"⏳ Вы временно ограничены в использовании бота до {dt.strftime('%d.%m %H:%M')}.\n"
+            "Спасибо за понимание.",
+            reply_markup=ReplyKeyboardMarkup([[
+                KeyboardButton("ℹ️ Помощь")
+            ]], resize_keyboard=True)
+        )
+        return
+    
     data = get_user_profile(user.id)
     if not data:
         await update.message.reply_text(
@@ -705,6 +748,19 @@ async def find_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Слишком много запросов. Подождите минуту.")
         return
 
+    # Проверка на временный бан
+    if is_user_banned(user.id):
+        banned_until = get_banned_until(user.id)
+        dt = datetime.fromisoformat(banned_until)
+        await update.message.reply_text(
+            f"⏳ Вы временно ограничены в использовании бота до {dt.strftime('%d.%m %H:%M')}.\n"
+            "Спасибо за понимание.",
+            reply_markup=ReplyKeyboardMarkup([[
+                KeyboardButton("ℹ️ Помощь")
+            ]], resize_keyboard=True)
+        )
+        return
+
     if not is_profile_complete(user.id):
         await context.bot.send_message(
             chat_id=chat_id,
@@ -737,6 +793,7 @@ async def find_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["partner_queue"] = [p[0] for p in partners_sorted]
     context.user_data["partner_data"] = {p[0]: p for p in partners_sorted}
     context.user_data["current_partner_index"] = 0
+    context.user_data["original_partners"] = [p[0] for p in partners_sorted]  # Сохраняем оригинальный список
 
     await show_partner(chat_id, context, partners_sorted[0])
 
@@ -770,12 +827,14 @@ async def show_partner(chat_id, context: ContextTypes.DEFAULT_TYPE, partner):
 async def next_partner(chat_id, context: ContextTypes.DEFAULT_TYPE, user_id):
     queue = context.user_data.get("partner_queue", [])
     if not queue:
+        # Если очередь закончилась, предлагаем начать сначала
         await context.bot.send_message(
             chat_id=chat_id,
-            text="🎉 Вы просмотрели всех!",
-            reply_markup=main_keyboard(),
+            text="🎉 Вы просмотрели всех доступных напарников!\n\nХотите начать поиск заново?",
+            reply_markup=restart_search_keyboard(),
         )
         return
+    
     next_id = queue.pop(0)
     context.user_data["partner_queue"] = queue
     partner = context.user_data.get("partner_data", {}).get(next_id)
@@ -856,16 +915,66 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         deactivate_user(query.from_user.id)
         await query.edit_message_text("❌ Профиль скрыт из поиска.")
 
-    # ---------- АДМИН: БЛОКИРОВКА И СНЯТИЕ ЖАЛОБ ──
-    elif action == "admin_block":
-        target_id = int(data[1])
-        block_user(target_id)
-        clear_reports_for(target_id)
-        await query.edit_message_text(f"✅ Пользователь {target_id} заблокирован и жалобы сняты.")
-    elif action == "admin_dismiss":
+    # ---------- АДМИН: ОБРАБОТКА ЖАЛОБ И БАНОВ ----------
+    elif action == "admin_clear_reports":
         target_id = int(data[1])
         clear_reports_for(target_id)
-        await query.edit_message_text(f"🗑️ Жалобы на пользователя {target_id} сняты.")
+        await query.edit_message_text(
+            f"🗑️ Жалобы на пользователя {target_id} сняты.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад", callback_data="admin_back_to_reports")
+            ]])
+        )
+
+    elif action == "admin_ban_5d":
+        target_id = int(data[1])
+        ban_user_temporarily(target_id, days=5)
+        banned_until = get_banned_until(target_id)
+        dt = datetime.fromisoformat(banned_until)
+        
+        # Уведомляем пользователя о бане
+        try:
+            await context.bot.send_message(
+                target_id,
+                "⏳ Вы временно ограничены в использовании бота на 5 дней из-за жалоб.\n\n"
+                "Это помогает поддерживать порядок в сообществе. Спасибо за понимание."
+            )
+        except:
+            pass
+            
+        await query.edit_message_text(
+            f"⏳ Пользователь {target_id} заблокирован до {dt.strftime('%d.%m %H:%M')}.\n"
+            "Жалобы сняты.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔓 Принудительно разблокировать", callback_data=f"admin_unban_{target_id}")
+            ]])
+        )
+        clear_reports_for(target_id)
+
+    elif action == "admin_unban":
+        target_id = int(data[1])
+        unban_user(target_id)
+        
+        # Уведомляем пользователя о разблокировке
+        try:
+            await context.bot.send_message(
+                target_id,
+                "🔓 Ваша временная блокировка снята. Можете продолжать пользоваться ботом!"
+            )
+        except:
+            pass
+            
+        await query.edit_message_text(
+            f"🔓 Пользователь {target_id} разблокирован вручную.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад", callback_data="admin_back_to_reports")
+            ]])
+        )
+
+    elif action == "admin_back_to_reports":
+        # Перезапускаем /reports
+        await reports_command(update, context)
+        await query.delete_message()
 
     # ---------- ПОМОЩЬ ПО STEAM И ПРОВЕРКА ПОДПИСКИ ──
     elif action == "steam_help":
@@ -905,6 +1014,45 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=subscribe_keyboard(),
             )
 
+    # ---------- НАЧАТЬ ПОИСК ЗАНОВО ----------
+    elif action == "restart_search":
+        user_id = query.from_user.id
+        original_partners = context.user_data.get("original_partners", [])
+        partner_data = context.user_data.get("partner_data", {})
+        
+        if not original_partners:
+            await query.edit_message_text(
+                "❌ Нет доступных анкет для повторного просмотра.",
+                reply_markup=main_keyboard()
+            )
+            return
+            
+        # Восстанавливаем очередь
+        context.user_data["partner_queue"] = original_partners.copy()
+        
+        # Показываем первого партнера
+        first_partner_id = original_partners[0]
+        partner = partner_data.get(first_partner_id)
+        if partner:
+            await query.edit_message_text("🔄 Начинаем поиск заново...", reply_markup=None)
+            await show_partner(query.message.chat_id, context, partner)
+        else:
+            await query.edit_message_text(
+                "❌ Ошибка при повторном запуске поиска.",
+                reply_markup=main_keyboard()
+            )
+
+    elif action == "main_menu":
+        await query.edit_message_text(
+            "🏠 Возвращаемся в главное меню...",
+            reply_markup=None
+        )
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="Выберите действие:",
+            reply_markup=main_keyboard()
+        )
+
 # ── ПАГИНАЦИЯ ЛАЙКОВ ──
 async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -931,6 +1079,20 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 @subscription_required
 async def show_likes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    
+    # Проверка на временный бан
+    if is_user_banned(user.id):
+        banned_until = get_banned_until(user.id)
+        dt = datetime.fromisoformat(banned_until)
+        await update.message.reply_text(
+            f"⏳ Вы временно ограничены в использовании бота до {dt.strftime('%d.%m %H:%M')}.\n"
+            "Спасибо за понимание.",
+            reply_markup=ReplyKeyboardMarkup([[
+                KeyboardButton("ℹ️ Помощь")
+            ]], resize_keyboard=True)
+        )
+        return
+    
     pending = get_pending_likes(user.id)
     if not pending:
         await update.message.reply_text("❌ Пока нет новых лайков.", reply_markup=main_keyboard())
@@ -1016,29 +1178,54 @@ async def notify_match(context: ContextTypes.DEFAULT_TYPE, user_a: int, user_b: 
 # ── АДМИН: СПИСОК ЖАЛОБ ──
 @admin_only
 async def reports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /reports – выводит все анкеты, на которые есть жалобы."""
+    """Показывает жалобы в виде кнопок"""
     reports = get_reports_summary()
     if not reports:
         await update.message.reply_text("📭 Нет активных жалоб.", reply_markup=main_keyboard())
         return
 
     for reported_id, cnt in reports:
-        prof = get_user_profile(reported_id)
-        if prof:
-            name, hours, age, bio, username, _, _ = prof
+        profile = get_user_profile(reported_id)
+        banned_until = get_banned_until(reported_id)
+        is_banned = banned_until is not None
+
+        if profile:
+            name, hours, age, bio, username, _, _ = profile
             preview = f"{name}, {hours}ч, {age} лет"
+            link = f"@{username}" if username else "не указано"
         else:
             preview = "Пользователь удалён"
+            link = "неизвестно"
 
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"🚫 Заблокировать ({cnt})", callback_data=f"admin_block_{reported_id}")],
-            [InlineKeyboardButton("🗑️ Снять жалобы", callback_data=f"admin_dismiss_{reported_id}")],
-        ])
+        status = "🚫 Заблокирован" if is_banned else "🟢 Активен"
+        time_left = ""
+        if is_banned:
+            dt = datetime.fromisoformat(banned_until)
+            time_left = f"\n⏱ До разблокировки: {dt.strftime('%d.%m %H:%M')}"
+
+        kb = [
+            [InlineKeyboardButton(
+                "✅ Снять жалобы и разблокировать" if is_banned else "🛡️ Снять жалобы",
+                callback_data=f"admin_clear_reports_{reported_id}"
+            )],
+            [InlineKeyboardButton(
+                "⏳ Забанить на 5 дней", callback_data=f"admin_ban_5d_{reported_id}"
+            )],
+        ]
+        if is_banned:
+            kb.append([InlineKeyboardButton(
+                "🔓 Принудительно разблокировать", callback_data=f"admin_unban_{reported_id}"
+            )])
+
+        markup = InlineKeyboardMarkup(kb)
 
         await update.message.reply_text(
-            f"🛑 *Жалобы*: {cnt}\n👤 *Пользователь*: {preview}",
+            f"🛑 *Жалобы*: {cnt}\n"
+            f"👤 *Пользователь*: {preview}\n"
+            f"🔗 *Telegram*: {link}\n"
+            f"📊 *Статус*: {status}{time_left}",
             parse_mode="Markdown",
-            reply_markup=kb,
+            reply_markup=markup,
         )
 
 # ── АДМИН: БЛОКИРОВКА/РАЗБЛОКИРОВКА ЧЕРЕЗ ТЕКСТОВЫЕ КОМАНДЫ ──
@@ -1050,8 +1237,8 @@ async def block_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         tg_id = int(args[0])
-        block_user(tg_id)
-        await update.message.reply_text(f"✅ Пользователь {tg_id} заблокирован.")
+        ban_user_temporarily(tg_id, days=5)
+        await update.message.reply_text(f"✅ Пользователь {tg_id} заблокирован на 5 дней.")
     except ValueError:
         await update.message.reply_text("⚠️ Неверный ID.")
 
@@ -1063,20 +1250,30 @@ async def unblock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         tg_id = int(args[0])
-        unblock_user(tg_id)
+        unban_user(tg_id)
         await update.message.reply_text(f"✅ Пользователь {tg_id} разблокирован.")
     except ValueError:
         await update.message.reply_text("⚠️ Неверный ID.")
 
 @admin_only
 async def blocked_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    blocked = get_blocked_list()
-    if not blocked:
+    # Получаем всех забаненных пользователей
+    with Database() as cur:
+        cur.execute(
+            "SELECT user_id, banned_until FROM temp_bans WHERE banned_until > ?",
+            (datetime.now().isoformat(),)
+        )
+        rows = cur.fetchall()
+    
+    if not rows:
         await update.message.reply_text("📭 Список блокировок пуст.", reply_markup=main_keyboard())
         return
+    
     text = "🚫 *Заблокированные пользователи*:\n"
-    for uid in blocked:
-        text += f"• {uid}\n"
+    for uid, banned_until in rows:
+        dt = datetime.fromisoformat(banned_until)
+        text += f"• {uid} (до {dt.strftime('%d.%m %H:%M')})\n"
+    
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
 
 # ── ОБРАБОТЧИК ОШИБОК ──
