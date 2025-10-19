@@ -144,17 +144,6 @@ def init_db() -> None:
             """
         )
 
-        # Уведомления о новых пользователях
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS new_user_notifications (
-                user_id INTEGER,
-                notified_new_id INTEGER,
-                PRIMARY KEY (user_id, notified_new_id)
-            )
-            """
-        )
-
         # Таблица заблокированных пользователей
         cur.execute(
             """
@@ -507,12 +496,625 @@ def admin_only(func):
 # ───────────────────────────────────────
 #   ХЭНДЛЕРЫ
 # ───────────────────────────────────────
+@subscription_required
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not await check_subscription(user.id, context):
-        await ask_to_subscribe(update)
-        return
-
     if get_user_profile(user.id):
         await update.message.reply_text(
-            f
+            f"👋 С возвращением, {user.first_name}!", reply_markup=main_keyboard()
+        )
+        return
+
+    await update.message.reply_text(
+        f"👋 Привет, {user.first_name}! Давай создадим профиль.\n"
+        "Как указать часы в Rust?",
+        reply_markup=steam_keyboard(),
+    )
+    context.user_data["step"] = "choose_method"
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "ℹ️ *Помощь*\n\n"
+        "• 🔍 *Найти напарника* — начать поиск.\n"
+        "• 🔄 *Обновить анкету* — изменить данные.\n"
+        "• 👤 *Прфиль* — посмотреть свою анкету.\n"
+        "• 📊 *Статистика* — ваша активность.\n"
+        "• ❤️ *Посмотреть лайки* — кто вас лайкнул.\n"
+        "• 🔕 *Скрыть анкету* — чтобы вас не показывали.\n\n"
+        "🔧 **Команды для администратора:**\n"
+        "`/reports` — список анкет с жалобами.\n"
+        "`/block <id>` — заблокировать пользователя.\n"
+        "`/unblock <id>` — снять блокировку.\n",
+        parse_mode="Markdown",
+        reply_markup=main_keyboard(),
+    )
+
+@subscription_required
+async def start_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Сколько часов ты откатал в Rust?", reply_markup=steam_keyboard()
+    )
+    context.user_data["step"] = "choose_method"
+
+# ── ОБРАБОТКА ТЕКСТОВ И ШАГОВ АНКЕТЫ ──
+@subscription_required
+async def handle_text_and_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    text = update.message.text.strip()
+    step = context.user_data.get("step")
+    user = update.effective_user
+
+    # ==============================
+    # 1️⃣ ШАГИ СОЗДАНИЯ/ОБНОВЛЕНИЯ
+    # ==============================
+    if step == "choose_method":
+        if text.isdigit() and len(text) > 5:            # скорее всего Steam‑ID
+            result = verify_user_steam(user.id, text)
+            if isinstance(result, int):
+                await update.message.reply_text(
+                    f"✅ Получено {result} часов из Steam.\n"
+                    "Теперь укажите ваш возраст:",
+                )
+                context.user_data["hours"] = result
+                context.user_data["step"] = "age"
+            elif result == "invalid_id":
+                await update.message.reply_text(
+                    "⚠️ Неверный формат Steam ID. Проверьте ID и попробуйте снова.",
+                    reply_markup=steam_help_keyboard()
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ Не удалось получить часы из Steam. Введите их вручную."
+                )
+                context.user_data["step"] = "hours_manual"
+            return
+        else:
+            await update.message.reply_text(
+                "Введите ваш Steam‑ID (цифры) **или** нажмите кнопку «Ввести часы вручную».",
+                parse_mode="Markdown",
+            )
+            return
+
+    if step == "hours_manual":
+        try:
+            hours = int(text)
+            if not validate_hours(hours):
+                await update.message.reply_text("Введите корректное количество часов (0-20000).")
+                return
+            context.user_data["hours"] = hours
+            await update.message.reply_text("📅 Укажите ваш возраст:")
+            context.user_data["step"] = "age"
+        except ValueError:
+            await update.message.reply_text("Введите число, например: 150")
+        return
+
+    if step == "age":
+        try:
+            age = int(text)
+            if not validate_age(age):
+                await update.message.reply_text("Возраст должен быть от 10 до 100.")
+                return
+            context.user_data["age"] = age
+            await update.message.reply_text("💬 Напишите немного о себе:")
+            context.user_data["step"] = "bio"
+        except ValueError:
+            await update.message.reply_text("Введите число, например: 25")
+        return
+
+    if step == "bio":
+        if not validate_bio(text):
+            await update.message.reply_text("Текст должен быть от 5 до 500 символов.")
+            return
+        context.user_data["bio"] = text
+        save_user(
+            user.id,
+            user.first_name,
+            context.user_data["hours"],
+            context.user_data["age"],
+            context.user_data["bio"],
+            user.username,
+        )
+        await update.message.reply_text(
+            "✅ Профиль сохранён! Теперь можно искать напарников.",
+            reply_markup=main_keyboard(),
+        )
+        context.user_data["step"] = None
+        return
+
+    # ==============================
+    # 2️⃣ ОБРАБОТКА КНОПОК МЕНЮ
+    # ==============================
+    if text == "🔍 Найти напарника":
+        await find_partner(update, context)
+    elif text == "🔄 Обновить анкету":
+        await start_profile(update, context)
+    elif text == "👤 Профиль":
+        await profile_command(update, context)
+    elif text == "📊 Статистика":
+        await stats_command(update, context)
+    elif text == "❤️ Посмотреть лайки":
+        await show_likes_command(update, context)
+    elif text == "🔕 Скрыть анкету":
+        deactivate_user(user.id)
+        await update.message.reply_text(
+            "❌ Ваша анкета скрыта из поиска.", reply_markup=main_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            "Не понял. Выберите действие из меню.", reply_markup=main_keyboard()
+        )
+
+# ── ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ ──
+@subscription_required
+async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    data = get_user_profile(user.id)
+    if not data:
+        await update.message.reply_text(
+            "❌ У вас нет анкеты. Нажмите «🔄 Обновить анкету».",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    name, hours, age, bio, username, is_active, is_verified = data
+    status = "✅ Показывается" if is_active else "❌ Скрыта"
+    verified = "✅ ВЕРИФИЦИРОВАН" if is_verified else ""
+
+    await update.message.reply_text(
+        f"📋 *Твой профиль {verified}*\n\n"
+        f"📛 Имя: {name}\n"
+        f"⏰ Часы в Rust: {hours}\n"
+        f"🎂 Возраст: {age}\n"
+        f"💬 О себе: {bio}\n"
+        f"🔗 Telegram: @{username if username else 'не указано'}\n"
+        f"👁️ Статус: {status}",
+        parse_mode="Markdown",
+        reply_markup=profile_keyboard(),
+    )
+
+# ── СТАТИСТИКА ──
+@subscription_required
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    viewed, likes, matches = get_stats(update.effective_user.id)
+    await update.message.reply_text(
+        "📊 *Твоя статистика*\n\n"
+        f"👁️ Просмотрено анкет: {viewed}\n"
+        f"❤️ Лайков поставлено: {likes}\n"
+        f"🔥 Взаимных матчей: {matches}",
+        parse_mode="Markdown",
+        reply_markup=main_keyboard(),
+    )
+
+# ── УМНЫЙ ПОДБОР ПАРТНЁРА ──
+def advanced_similarity(current_hours, current_age, partner):
+    _, _, hours, age, bio, _, is_verified = partner
+    diff = abs(hours - current_hours) * 0.5 + abs(age - current_age) * 0.5
+    verified_bonus = -20 if is_verified else 0
+    keyword_bonus = -10 if bio and any(w in bio.lower() for w in ["спокойный", "тихий", "база", "дружелюбный"]) else 0
+    return diff + verified_bonus + keyword_bonus
+
+@subscription_required
+async def find_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    # Проверка ограничения запросов
+    if not limiter.check_limit(user.id, "find_partner", 10, 60):
+        await update.message.reply_text("⚠️ Слишком много запросов. Подождите минуту.")
+        return
+
+    if not is_profile_complete(user.id):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="📝 Сначала создайте анкету. Нажмите «🔄 Обновить анкету».",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    profile = get_user_profile(user.id)
+    if not profile:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ Ошибка загрузки профиля.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    cur_hours, cur_age = profile[1], profile[2]
+
+    partners = get_all_active_partners(user.id)
+    if not partners:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="😢 Пока нет доступных участников.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    partners_sorted = sorted(partners, key=lambda p: advanced_similarity(cur_hours, cur_age, p))
+    context.user_data["partner_queue"] = [p[0] for p in partners_sorted]
+    context.user_data["partner_data"] = {p[0]: p for p in partners_sorted}
+    context.user_data["current_partner_index"] = 0
+
+    await show_partner(chat_id, context, partners_sorted[0])
+
+async def show_partner(chat_id, context: ContextTypes.DEFAULT_TYPE, partner):
+    partner_id, name, hours, age, bio, username, is_verified = partner
+    context.user_data["current_partner_id"] = partner_id
+    verified_badge = "✅" if is_verified else ""
+
+    kb = [
+        [
+            InlineKeyboardButton("❤️ Лайк", callback_data=f"like_{partner_id}"),
+            InlineKeyboardButton("👎 Дизлайк", callback_data=f"dislike_{partner_id}"),
+        ],
+        [InlineKeyboardButton("🚨 Пожаловаться", callback_data=f"report_{partner_id}")],
+    ]
+    markup = InlineKeyboardMarkup(kb)
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"👤 *Найден напарник {verified_badge}*\n\n"
+            f"📛 Имя: {name}\n"
+            f"⏰ Часы в Rust: {hours}\n"
+            f"🎂 Возраст: {age}\n"
+            f"💬 О себе: {bio}"
+        ),
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+
+async def next_partner(chat_id, context: ContextTypes.DEFAULT_TYPE, user_id):
+    queue = context.user_data.get("partner_queue", [])
+    if not queue:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="🎉 Вы просмотрели всех!",
+            reply_markup=main_keyboard(),
+        )
+        return
+    next_id = queue.pop(0)
+    context.user_data["partner_queue"] = queue
+    partner = context.user_data.get("partner_data", {}).get(next_id)
+    if partner:
+        await show_partner(chat_id, context, partner)
+
+# ── ОТВЕТ НА ПРИХОДЯЩИЙ ЛАЙК, ПАГИНАЦИЯ И ЖАЛОБЫ ──
+@subscription_required
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    data = query.data.split("_")
+    action = data[0]
+
+    # ---------- ЛАЙК / ДИЗЛАЙК ----------
+    if action in ("like", "dislike"):
+        partner_id = int(data[1])
+        user_id = query.from_user.id
+        user_name = query.from_user.first_name
+
+        if action == "like":
+            is_match = add_like(user_id, partner_id)
+            update_stat(user_id, "likes_given")
+            if is_match:
+                await query.edit_message_text("🎉 *У вас взаимный матч!*", parse_mode="Markdown")
+                await notify_match(context, user_id, partner_id)
+            else:
+                await query.edit_message_text("❤️ Вы поставили лайк. Ищем дальше…")
+                add_pending_like(user_id, partner_id, user_name)
+                await next_partner(query.message.chat_id, context, user_id)
+        else:  # dislike
+            await query.edit_message_text("👎 Вы поставили дизлайк. Ищем следующего…")
+            await next_partner(query.message.chat_id, context, user_id)
+
+    # ---------- ОТВЕТ НА ПРИХОДЯЩИЙ ЛАЙК ----------
+    elif action == "respond":
+        resp_type = data[1]          # like / dislike
+        from_id = int(data[2])       # кто лайкнул вас
+        user_id = query.from_user.id
+
+        if resp_type == "like":
+            is_match = add_like(user_id, from_id)
+            remove_pending_like(from_id, user_id)
+            if is_match:
+                await query.edit_message_text("🎉 *У вас взаимный матч!*", parse_mode="Markdown")
+                await notify_match(context, user_id, from_id)
+            else:
+                await query.edit_message_text("❤️ Вы ответили лайком!")
+        else:  # dislike
+            remove_pending_like(from_id, user_id)
+            await query.edit_message_text("👎 Вы отклонили лайк.")
+        # Показать следующий полученный лайк
+        await show_next_like(query.message, context)
+
+    # ---------- ЖАЛОБА НА ПОЛЬЗОВАТЕЛЯ ----------
+    elif action == "report":
+        reported_id = int(data[1])
+        reporter_id = query.from_user.id
+        add_report(reporter_id, reported_id)
+        await query.edit_message_text("🚨 Жалоба отправлена. Спасибо!")
+        # Уведомляем администратора
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    admin_id,
+                    f"🚨 Новая жалоба на пользователя {reported_id} от {reporter_id}",
+                )
+            except Exception:
+                pass
+
+    # ---------- АКТИВАЦИЯ/ДЕАКТИВАЦИЯ ПРОФИЛЯ (из профиля) ----------
+    elif action == "activate_profile":
+        activate_user(query.from_user.id)
+        await query.edit_message_text("✅ Профиль снова виден в поиске.")
+    elif action == "deactivate_profile":
+        deactivate_user(query.from_user.id)
+        await query.edit_message_text("❌ Профиль скрыт из поиска.")
+
+    # ---------- АДМИН: БЛОКИРОВКА И СНЯТИЕ ЖАЛОБ ──
+    elif action == "admin_block":
+        target_id = int(data[1])
+        block_user(target_id)
+        clear_reports_for(target_id)
+        await query.edit_message_text(f"✅ Пользователь {target_id} заблокирован и жалобы сняты.")
+    elif action == "admin_dismiss":
+        target_id = int(data[1])
+        clear_reports_for(target_id)
+        await query.edit_message_text(f"🗑️ Жалобы на пользователя {target_id} сняты.")
+
+    # ---------- ПОМОЩЬ ПО STEAM И ПРОВЕРКА ПОДПИСКИ ──
+    elif action == "steam_help":
+        help_text = (
+            "🎮 *Как найти ваш Steam ID:*\n\n"
+            "1. Откройте Steam клиент\n"
+            "2. Перейдите в свой профиль\n"
+            "3. Скопируйте цифры из адресной строки\n"
+            "Пример: https://steamcommunity.com/profiles/76561198000000000\n"
+            "Ваш Steam ID: 76561198000000000\n\n"
+            "Или:\n"
+            "1. Откройте свой профиль в Steam\n"
+            "2. Нажмите \"Копировать профиль URL\"\n"
+            "3. Вставьте в любом текстовом редакторе\n"
+            "4. Извлеките цифры после /profiles/"
+        )
+        await query.edit_message_text(help_text, parse_mode="Markdown", reply_markup=steam_help_keyboard())
+    
+    elif action == "back_to_hours":
+        await query.edit_message_text(
+            "Сколько часов ты откатал в Rust?", 
+            reply_markup=steam_keyboard()
+        )
+
+    elif action == "check_subscription":
+        user_id = query.from_user.id
+        if await check_subscription(user_id, context):
+            await query.edit_message_text(
+                "✅ Спасибо за подписку! Теперь вы можете пользоваться ботом.\n\n"
+                "Выберите действие:",
+                reply_markup=main_keyboard()
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ Вы ещё не подписаны на {REQUIRED_CHANNEL}.\n\n"
+                "Подпишитесь и нажмите кнопку ниже, чтобы проверить:",
+                reply_markup=subscribe_keyboard(),
+            )
+
+# ── ПАГИНАЦИЯ ЛАЙКОВ ──
+async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    data = query.data.split("_")
+    direction = data[0]  # prev / next
+    idx = int(data[1])
+
+    pending = context.user_data.get("pending_likes", [])
+    if not pending:
+        return
+
+    if direction == "prev":
+        new_idx = max(0, idx - 1)
+    else:
+        new_idx = min(len(pending) - 1, idx + 1)
+
+    context.user_data["current_like_index"] = new_idx
+    await show_next_like(query.message, context)
+
+# ── ЛАЙКИ И ПАГИНАЦИЯ ──
+@subscription_required
+async def show_likes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    pending = get_pending_likes(user.id)
+    if not pending:
+        await update.message.reply_text("❌ Пока нет новых лайков.", reply_markup=main_keyboard())
+        return
+    context.user_data["pending_likes"] = pending
+    context.user_data["current_like_index"] = 0
+    await show_next_like(update, context)
+
+async def show_next_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending = context.user_data.get("pending_likes", [])
+    idx = context.user_data.get("current_like_index", 0)
+
+    if idx >= len(pending):
+        await update.message.reply_text("✅ Все лайки просмотрены!", reply_markup=main_keyboard())
+        return
+
+    from_id, from_name = pending[idx]
+    profile = get_user_profile(from_id)
+    if not profile:
+        context.user_data["current_like_index"] = idx + 1
+        await show_next_like(update, context)
+        return
+
+    name, hours, age, bio, username, _, is_verified = profile
+    verified_badge = "✅" if is_verified else ""
+
+    kb = [
+        [
+            InlineKeyboardButton("❤️ Ответить", callback_data=f"respond_like_{from_id}"),
+            InlineKeyboardButton("👎 Отклонить", callback_data=f"respond_dislike_{from_id}"),
+        ],
+        [InlineKeyboardButton("🚨 Пожаловаться", callback_data=f"report_{from_id}")],
+        [
+            InlineKeyboardButton("⬅️", callback_data=f"prev_{idx}"),
+            InlineKeyboardButton(f"{idx+1}/{len(pending)}", callback_data="noop"),
+            InlineKeyboardButton("➡️", callback_data=f"next_{idx}"),
+        ],
+    ]
+    markup = InlineKeyboardMarkup(kb)
+
+    await update.message.reply_text(
+        f"❤️ *Тебя лайкнул(а) {from_name}! {verified_badge}*\n\n"
+        f"👤 *Профиль*\n"
+        f"📛 Имя: {name}\n"
+        f"⏰ Часы: {hours}\n"
+        f"🎂 Возраст: {age}\n"
+        f"💬 О себе: {bio}\n"
+        f"🔗 Telegram: @{username if username else 'не указано'}",
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+
+# ── УВЕДОМЛЕНИЕ О МАТЧАХ ──
+async def notify_match(context: ContextTypes.DEFAULT_TYPE, user_a: int, user_b: int):
+    a_profile = get_user_profile(user_a)
+    b_profile = get_user_profile(user_b)
+    if not a_profile or not b_profile:
+        return
+
+    _, _, _, _, _, username_a = a_profile
+    _, _, _, _, _, username_b = b_profile
+    link_a = f"@{username_a}" if username_a else "не указано"
+    link_b = f"@{username_b}" if username_b else "не указано"
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_a,
+            text=f"🎉 *Матч!* {link_b} тоже вас лайкнул!",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error(f"Failed to send match notification to user {user_a}: {e}")
+    
+    try:
+        await context.bot.send_message(
+            chat_id=user_b,
+            text=f"🎉 *Матч!* {link_a} тоже вас лайкнул!",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error(f"Failed to send match notification to user {user_b}: {e}")
+
+# ── АДМИН: СПИСОК ЖАЛОБ ──
+@admin_only
+async def reports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /reports – выводит все анкеты, на которые есть жалобы."""
+    reports = get_reports_summary()
+    if not reports:
+        await update.message.reply_text("📭 Нет активных жалоб.", reply_markup=main_keyboard())
+        return
+
+    for reported_id, cnt in reports:
+        prof = get_user_profile(reported_id)
+        if prof:
+            name, hours, age, bio, username, _, _ = prof
+            preview = f"{name}, {hours}ч, {age} лет"
+        else:
+            preview = "Пользователь удалён"
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"🚫 Заблокировать ({cnt})", callback_data=f"admin_block_{reported_id}")],
+            [InlineKeyboardButton("🗑️ Снять жалобы", callback_data=f"admin_dismiss_{reported_id}")],
+        ])
+
+        await update.message.reply_text(
+            f"🛑 *Жалобы*: {cnt}\n👤 *Пользователь*: {preview}",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+
+# ── АДМИН: БЛОКИРОВКА/РАЗБЛОКИРОВКА ЧЕРЕЗ ТЕКСТОВЫЕ КОМАНДЫ ──
+@admin_only
+async def block_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("⚠️ Укажите ID: /block 123456789")
+        return
+    try:
+        tg_id = int(args[0])
+        block_user(tg_id)
+        await update.message.reply_text(f"✅ Пользователь {tg_id} заблокирован.")
+    except ValueError:
+        await update.message.reply_text("⚠️ Неверный ID.")
+
+@admin_only
+async def unblock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("⚠️ Укажите ID: /unblock 123456789")
+        return
+    try:
+        tg_id = int(args[0])
+        unblock_user(tg_id)
+        await update.message.reply_text(f"✅ Пользователь {tg_id} разблокирован.")
+    except ValueError:
+        await update.message.reply_text("⚠️ Неверный ID.")
+
+@admin_only
+async def blocked_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    blocked = get_blocked_list()
+    if not blocked:
+        await update.message.reply_text("📭 Список блокировок пуст.", reply_markup=main_keyboard())
+        return
+    text = "🚫 *Заблокированные пользователи*:\n"
+    for uid in blocked:
+        text += f"• {uid}\n"
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
+
+# ── ОБРАБОТЧИК ОШИБОК ──
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Исключение:", exc_info=context.error)
+
+# ── ЗАПУСК БОТА ──
+def main():
+    init_db()
+    TOKEN = os.getenv("TELEGRAM_TOKEN")
+    if not TOKEN:
+        logger.error("❌ Не найден токен в переменной TELEGRAM_TOKEN")
+        return
+
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    # Основные команды
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+
+    # **Админ‑команды**
+    app.add_handler(CommandHandler("reports", reports_command))
+    app.add_handler(CommandHandler("block", block_cmd))
+    app.add_handler(CommandHandler("unblock", unblock_cmd))
+    app.add_handler(CommandHandler("blocked", blocked_list_cmd))
+
+    # Обработчики текста и меню
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_and_buttons))
+
+    # Inline‑кнопки (лайк, дизлайк, жалоба, ответы, пагинация, админ)
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(CallbackQueryHandler(pagination_callback, pattern="^(prev|next)_"))
+
+    # Ошибки
+    app.add_error_handler(error_handler)
+
+    logger.info("✅ Бот запущен!")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
