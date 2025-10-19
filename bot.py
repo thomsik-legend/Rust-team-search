@@ -1083,7 +1083,31 @@ async def blocked_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Исключение:", exc_info=context.error)
 
-# ── ЗАПУСК БОТА ──
+# ───────────────────────────────────────
+#   ⚠️ ВАЖНО: ДОБАВЛЯЕМ FLASK-СЕРВЕР ДЛЯ RENDER
+# ───────────────────────────────────────
+from flask import Flask
+import threading
+import os
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is alive! ✅"
+
+def run():
+    port = int(os.getenv("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# Запускаем веб-сервер в отдельном потоке
+t = threading.Thread(target=run)
+t.daemon = True
+t.start()
+
+# ───────────────────────────────────────
+#   ЗАПУСК БОТА
+# ───────────────────────────────────────
 def main():
     init_db()
     TOKEN = os.getenv("TELEGRAM_TOKEN")
