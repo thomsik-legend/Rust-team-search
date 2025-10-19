@@ -1,3 +1,4 @@
+import time
 import os
 import logging
 import sqlite3
@@ -1313,12 +1314,19 @@ t.start()
 # ───────────────────────────────────────
 #   ЗАПУСК БОТА
 # ───────────────────────────────────────
+# ───────────────────────────────────────
+#   ЗАПУСК БОТА
+# ───────────────────────────────────────
 def main():
     init_db()
     TOKEN = os.getenv("TELEGRAM_TOKEN")
     if not TOKEN:
         logger.error("❌ Не найден токен в переменной TELEGRAM_TOKEN")
         return
+
+    # Добавляем задержку, чтобы избежать конфликта с предыдущим экземпляром
+    logger.info("⏳ Ожидание 10 секунд перед запуском бота...")
+    time.sleep(10)
 
     app = ApplicationBuilder().token(TOKEN).build()
 
