@@ -483,17 +483,25 @@ async def ask_to_subscribe(update: Update):
 # ───────────────────────────────────────
 #   ДЕКОРАТОР ДЛЯ ПРОВЕРКИ ПОДПИСКИ
 # ───────────────────────────────────────
+# ───────────────────────────────────────
+#   ДЕКОРАТОР ДЛЯ ПРОВЕРКИ ПОДПИСКИ (УЛУЧШЕННЫЙ)
+# ───────────────────────────────────────
 def subscription_required(func):
     """Декоратор для проверки подписки перед выполнением функции"""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         if not await check_subscription(user.id, context):
-            await update.message.reply_text(
+            # Умный способ ответить: через сообщение или через callback-запрос
+            text = (
                 f"❌ Чтобы пользоваться ботом, подпишитесь на канал:\n"
                 f"{REQUIRED_CHANNEL}\n\n"
-                "После этого нажмите кнопку ниже, чтобы проверить:",
-                reply_markup=subscribe_keyboard(),
+                "После этого нажмите кнопку ниже, чтобы проверить:"
             )
+            if update.message:
+                await update.message.reply_text(text, reply_markup=subscribe_keyboard())
+            elif update.callback_query:
+                await update.callback_query.answer()
+                await update.callback_query.edit_message_text(text, reply_markup=subscribe_keyboard())
             return
         return await func(update, context)
     return wrapper
