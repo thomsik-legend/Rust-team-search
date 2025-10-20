@@ -1379,7 +1379,7 @@ def run():
 # ───────────────────────────────────────
 #   ЗАПУСК БОТА
 # ───────────────────────────────────────
-async def main_async():
+def main():
     init_db()
     TOKEN = os.getenv("TELEGRAM_TOKEN")
     if not TOKEN:
@@ -1397,15 +1397,15 @@ async def main_async():
 
     # Добавляем задержку, чтобы избежать конфликта с предыдущим экземпляром
     logger.info("⏳ Ожидание 10 секунд перед запуском бота...")
-    await asyncio.sleep(10)
+    time.sleep(10)
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # --- ВАЖНОЕ ИЗМЕНЕНИЕ ---
-    # Удаляем вебхук перед запуском polling'а
-    await app.bot.delete_webhook(drop_pending_updates=True)
+    # --- ВАЖНОЕ ИЗМЕНЕНИЕ: Удаляем вебхук перед запуском ---
+    # Это решает ошибку 409 Conflict, не меняя остальную логику
+    app.bot.delete_webhook(drop_pending_updates=True)
     logger.info("🧹 Вебхук удалён. Запускаем polling...")
-    # -------------------------
+    # ----------------------------------------------------
 
     # Основные команды
     app.add_handler(CommandHandler("start", start))
@@ -1428,11 +1428,7 @@ async def main_async():
     app.add_error_handler(error_handler)
 
     logger.info("✅ Бот запущен!")
-    await app.run_polling()
-
-def main():
-    import asyncio
-    asyncio.run(main_async())
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
