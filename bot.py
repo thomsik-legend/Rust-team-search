@@ -51,7 +51,7 @@ class RateLimiter:
     def check_limit(self, user_id, action, limit=5, period=60):
         now = datetime.now()
         
-        # Автоочистка старых запросов каждые 10 минут
+        # Автоочистка старых записей
         if (now - self.last_cleanup) > timedelta(minutes=10):
             self.cleanup_old_requests()
             self.last_cleanup = now
@@ -76,21 +76,18 @@ class RateLimiter:
         keys_to_remove = []
         
         for key, timestamps in self.requests.items():
-            # Оставляем только свежие запросы (менее 1 часа)
             fresh_timestamps = [t for t in timestamps if (now - t) < timedelta(hours=1)]
             if fresh_timestamps:
                 self.requests[key] = fresh_timestamps
             else:
                 keys_to_remove.append(key)
         
-        # Удаляем полностью пустые ключи
         for key in keys_to_remove:
             del self.requests[key]
         
         logger.info(f"RateLimiter cleanup: removed {len(keys_to_remove)} old keys")
-
+        
 limiter = RateLimiter()
-
 # ───────────────────────────────────────
 #   МЕНЕДЖЕР БАЗЫ ДАННЫХ
 # ───────────────────────────────────────
@@ -191,15 +188,11 @@ def init_db() -> None:
 def validate_steam_id(steam_id):
     """Проверка корректности Steam ID"""
     try:
-        # Преобразуем в число
         if isinstance(steam_id, str):
             if not steam_id.isdigit():
                 return False
             steam_id = int(steam_id)
-        
-        # Проверяем диапазон Steam ID (SteamID64)
         return 76561197960265728 <= steam_id <= 76561197960265728 + 2**32
-        
     except (ValueError, TypeError):
         return False
 
@@ -255,7 +248,6 @@ def get_user_profile(cur, tg_id):
     )
     return cur.fetchone()
 
-# --- НОВАЯ ФУНКЦИЯ ---
 def has_profile(user_id: int) -> bool:
     """Возвращает True, если у пользователя есть запись в таблице users."""
     return get_user_profile(user_id) is not None
@@ -286,7 +278,6 @@ def add_like(cur, from_id, to_id):
         (from_id, to_id),
     )
     
-    # Проверяем, есть ли взаимный лайк
     cur.execute(
         "SELECT 1 FROM likes WHERE from_id = ? AND to_id = ?", (to_id, from_id)
     )
@@ -395,7 +386,6 @@ def update_stat(cur, user_id, field):
     
     cur.execute("INSERT OR IGNORE INTO stats (user_id) VALUES (?)", (user_id,))
     
-    # БЕЗОПАСНЫЙ подход вместо f-строк
     if field == "viewed_profiles":
         cur.execute("UPDATE stats SET viewed_profiles = viewed_profiles + 1 WHERE user_id = ?", (user_id,))
     elif field == "likes_given":
@@ -415,21 +405,18 @@ def get_stats(cur, user_id):
 def verify_user_steam(tg_id, steam_id):
     """Получить часы из Steam и поставить статус верификации."""
     try:
-        # Валидация Steam ID
         if not validate_steam_id(steam_id):
             return "invalid_id"
         
-        # Проверка наличия API ключа
         if not STEAM_API_KEY:
             return "no_api_key"
         
-        # Запрос к API
         url = "http://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/"
         params = {
             "key": STEAM_API_KEY,
             "steamid": steam_id,
             "format": "json",
-            "appids_filter[0]": 252490,  # Rust
+            "appids_filter[0]": 252490,
         }
         
         response = requests.get(url, params=params, timeout=10)
@@ -442,7 +429,6 @@ def verify_user_steam(tg_id, steam_id):
             if game["appid"] == 252490:
                 hours = game.get("playtime_forever", 0) // 60
                 
-                # Обновляем профиль
                 try:
                     with Database() as cur:
                         cur.execute(
@@ -478,14 +464,12 @@ def main_keyboard():
         resize_keyboard=True,
     )
 
-# ✅ НОВАЯ ФУНКЦИЯ: Клавиатура для администратора
 def admin_main_keyboard():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("🔍 Найти напарника"), KeyboardButton("🔄 Обновить анкету")],
             [KeyboardButton("👤 Профиль"), KeyboardButton("📊 Статистика")],
             [KeyboardButton("❤️ Посмотреть лайки"), KeyboardButton("🔕 Скрыть анкету")],
-            # 🎉 ДОБАВЛЯЕМ КНОПКУ АДМИН-ПАНЕЛИ
             [KeyboardButton("⚙️ Админ-панель")],
         ],
         resize_keyboard=True,
@@ -556,7 +540,6 @@ def subscription_required(func):
         if is_user_banned(user.id):
             banned_until = get_banned_until(user.id)
             dt = datetime.fromisoformat(banned_until)
-            # Отвечаем в правильное сообщение (message или callback_query)
             if update.message:
                 await update.message.reply_text(
                     f"⏳ Вы временно ограничены в использовании бота до {dt.strftime('%d.%m %H:%M')}.\n"
@@ -574,7 +557,6 @@ def subscription_required(func):
 
         # Проверка подписки
         if not await check_subscription(user.id, context):
-            # Умный способ ответить: через сообщение или через callback-запрос
             text = (
                 f"❌ Чтобы пользоваться ботом, подпишитесь на канал:\n"
                 f"{REQUIRED_CHANNEL}\n\n"
@@ -607,26 +589,37 @@ def admin_only(func):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
-    # 🧾 Если профиль уже есть — показываем меню
+    # ПРОВЕРКА ПОДПИСКИ УЖЕ ВЫПОЛНЕНА в декораторе @subscription_required
+
+    # Проверяем, есть ли профиль
     if has_profile(user.id):
-        await update.message.reply_text(f"👋 С возвращением, {user.first_name}!")
+        welcome_text = f"👋 С возвращением, {user.first_name}!"
+    else:
+        welcome_text = f"👋 Привет, {user.first_name}! Создайте свою анкету, чтобы начать поиск напарника."
 
-        # ✅ ПРОВЕРЯЕМ, АДМИН ЛИ ПОЛЬЗОВАТЕЛЬ
-        if user.id in ADMIN_IDS:
-            # Если админ - показываем расширенную клавиатуру
-            await update.message.reply_text("🔐 Включён режим администратора.", reply_markup=admin_main_keyboard())
-        else:
-            # Если обычный пользователь - стандартную
-            await update.message.reply_text("Выберите действие:", reply_markup=main_keyboard())
-        return
+    # Показываем главное меню
+    if user.id in ADMIN_IDS:
+        await update.message.reply_text(
+            welcome_text + "\n\n🔐 Режим администратора включён.",
+            reply_markup=admin_main_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=main_keyboard()
+        )
 
-    # 🧩 Если профиля нет — начинаем создание
+
+@subscription_required
+async def start_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    # Начинаем создание/обновление анкеты
     await update.message.reply_text(
-        f"👋 Привет, {user.first_name}! Давай создадим профиль.\n"
-        "Как указать часы в Rust?",
-        reply_markup=steam_keyboard(),
+        f"📛 Как вас зовут?",
     )
-    context.user_data["step"] = "choose_method"
+    context.user_data["step"] = "name"
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -642,13 +635,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=main_keyboard(),
     )
-
-@subscription_required
-async def start_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Сколько часов ты откатал в Rust?", reply_markup=steam_keyboard()
-    )
-    context.user_data["step"] = "choose_method"
 
 # ── ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ ──
 @subscription_required
@@ -742,7 +728,7 @@ async def find_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["partner_queue"] = [p[0] for p in partners_sorted]
     context.user_data["partner_data"] = {p[0]: p for p in partners_sorted}
     context.user_data["current_partner_index"] = 0
-    context.user_data["original_partners"] = [p[0] for p in partners_sorted]  # Сохраняем оригинальный список
+    context.user_data["original_partners"] = [p[0] for p in partners_sorted]
 
     await show_partner(chat_id, context, partners_sorted[0])
 
@@ -776,7 +762,6 @@ async def show_partner(chat_id, context: ContextTypes.DEFAULT_TYPE, partner):
 async def next_partner(chat_id, context: ContextTypes.DEFAULT_TYPE, user_id):
     queue = context.user_data.get("partner_queue", [])
     if not queue:
-        # Если очередь закончилась, предлагаем начать сначала
         await context.bot.send_message(
             chat_id=chat_id,
             text="🎉 Вы просмотрели всех доступных напарников!\n\nХотите начать поиск заново?",
@@ -789,6 +774,184 @@ async def next_partner(chat_id, context: ContextTypes.DEFAULT_TYPE, user_id):
     partner = context.user_data.get("partner_data", {}).get(next_id)
     if partner:
         await show_partner(chat_id, context, partner)
+        # ── ОБРАБОТЧИК ТЕКСТА (сообщения от пользователя) ──
+@subscription_required
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text.strip()
+    step = context.user_data.get("step")
+
+    # Обработка шагов создания/обновления анкеты
+    if step == "name":
+        context.user_data["name"] = text
+        await update.message.reply_text("🎂 Укажите ваш возраст:")
+        context.user_data["step"] = "age"
+        return
+
+    if step == "age":
+        try:
+            age = int(text)
+            if not validate_age(age):
+                raise ValueError
+            context.user_data["age"] = age
+            await update.message.reply_text("⏰ Как указать часы в Rust?", reply_markup=steam_keyboard())
+            context.user_data["step"] = "choose_method"
+        except ValueError:
+            await update.message.reply_text("Возраст — число от 10 до 100.")
+        return
+
+    if step == "hours_manual":
+        try:
+            hours = int(text)
+            if not validate_hours(hours):
+                raise ValueError
+            context.user_data["hours"] = hours
+            await update.message.reply_text("💬 Расскажите немного о себе:")
+            context.user_data["step"] = "bio"
+        except ValueError:
+            await update.message.reply_text("Часы — число от 0 до 20000.")
+        return
+
+    if step == "bio":
+        if not validate_bio(text):
+            await update.message.reply_text("Текст — от 5 до 500 символов.")
+            return
+        context.user_data["bio"] = text
+
+        # Сохраняем пользователя
+        save_user(
+            user.id,
+            context.user_data["name"],
+            context.user_data["hours"],
+            context.user_data["age"],
+            context.user_data["bio"],
+            user.username,
+            is_active=1,
+            is_verified=0,
+        )
+
+        await update.message.reply_text(
+            "✅ Анкета успешно создана! Теперь вы можете искать напарников.",
+            reply_markup=main_keyboard(),
+        )
+        context.user_data.clear()
+        return
+
+    # Если профиль уже есть — обрабатываем кнопки меню
+    if has_profile(user.id):
+        if text == "🔍 Найти напарника":
+            await find_partner(update, context)
+        elif text == "🔄 Обновить анкету":
+            await start_profile(update, context)
+        elif text == "👤 Профиль":
+            await profile_command(update, context)
+        elif text == "📊 Статистика":
+            await stats_command(update, context)
+        elif text == "❤️ Посмотреть лайки":
+            await show_likes_command(update, context)
+        elif text == "🔕 Скрыть анкету":
+            deactivate_user(user.id)
+            await update.message.reply_text("❌ Ваша анкета скрыта из поиска.", reply_markup=main_keyboard())
+        elif text == "⚙️ Админ-панель":
+            if user.id in ADMIN_IDS:
+                await show_admin_panel(update, context)
+            else:
+                await update.message.reply_text("❌ У вас нет прав для этого действия.")
+        else:
+            await update.message.reply_text("Не понял. Выберите действие из меню.", reply_markup=main_keyboard())
+    else:
+        # Если профиля нет и не в процессе заполнения, но хочет использовать меню
+        if step is None:
+            await update.message.reply_text(
+                "❗ Для начала создайте анкету, нажав «🔄 Обновить анкету».",
+                reply_markup=main_keyboard()
+            )
+        # Иначе продолжаем заполнение
+
+# ── ОБРАБОТЧИК STEAM ID ──
+@subscription_required
+async def handle_steam_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    step = context.user_data.get("step")
+
+    if step == "waiting_steam_id":
+        steam_id = update.message.text.strip()
+        if not steam_id.isdigit():
+            await update.message.reply_text("⚠️ Введите только цифры вашего Steam-ID.")
+            return
+
+        result = verify_user_steam(user.id, steam_id)
+        if isinstance(result, int):
+            context.user_data["hours"] = result
+            await update.message.reply_text(f"✅ Получено {result} часов из Steam.\n💬 Теперь расскажите немного о себе:")
+            context.user_data["step"] = "bio"
+        else:
+            await update.message.reply_text("❌ Не удалось получить данные. Введите часы вручную:", reply_markup=steam_keyboard())
+            context.user_data["step"] = "hours_manual"
+
+# ── ОБРАБОТЧИК КНОПОК (CallbackQuery) ──
+@subscription_required
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user = query.from_user
+
+    step = context.user_data.get("step")
+
+    # Проверка: если профиля нет и это не создание анкеты → только разрешённые шаги
+    if not has_profile(user.id) and step != "name" and step != "age" and step != "hours_manual" and step != "choose_method" and step != "bio":
+        allowed_data = ["link_steam", "manual_hours", "steam_help", "back_to_hours", "check_subscription"]
+        if data not in allowed_data:
+            await query.edit_message_text(
+                "❗ Сначала создайте анкету, нажав «🔄 Обновить анкету».",
+                reply_markup=main_keyboard()
+            )
+            return
+
+    # Кнопки, связанные с вводом часов
+    if data == "link_steam":
+        await query.edit_message_text(
+            "🔗 *Привязка Steam аккаунта*\n\n"
+            "Отправьте ваш Steam-ID (только цифры).\n"
+            "❓ Как найти ID? — нажмите кнопку ниже.",
+            parse_mode="Markdown",
+            reply_markup=steam_help_keyboard()
+        )
+        context.user_data["step"] = "waiting_steam_id"
+        return
+
+    if data == "manual_hours":
+        await query.edit_message_text(
+            "✍️ Введите количество часов в Rust (0–20000):",
+            parse_mode="Markdown",
+        )
+        context.user_data["step"] = "hours_manual"
+        return
+
+    if data == "steam_help":
+        await query.edit_message_text(
+            "🎮 *Как найти ваш Steam ID:*\n\n"
+            "1️⃣ Откройте Steam → ваш профиль.\n"
+            "2️⃣ Скопируйте цифры из ссылки:\n"
+            "`https://steamcommunity.com/profiles/76561198000000000`\n"
+            "Ваш ID — числа после */profiles/*.\n\n"
+            "⬅️ Вернуться", 
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_hours")]])
+        )
+        return
+
+    if data == "back_to_hours":
+        await query.edit_message_text(
+            "⏰ Как указать часы в Rust?",
+            reply_markup=steam_keyboard()
+        )
+        context.user_data["step"] = "choose_method"
+        return
+
+    # Все остальные действия передаём в handle_callback
+    await handle_callback(update, context)
 
 # ── ПАГИНАЦИЯ ЛАЙКОВ ──
 async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -899,8 +1062,7 @@ async def notify_match(context: ContextTypes.DEFAULT_TYPE, user_a: int, user_b: 
     except Exception as e:
         logger.error(f"Failed to send match notification to user {user_b}: {e}")
 
-# --- НОВАЯ ФУНКЦИЯ ---
-# ✅ НОВАЯ ФУНКЦИЯ: Показывает inline-меню с админскими функциями
+# ── АДМИН-ПАНЕЛЬ ──
 async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup(
         [
@@ -911,185 +1073,7 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     )
     await update.message.reply_text("⚙️ *Админ-панель:*", parse_mode="Markdown", reply_markup=keyboard)
-# ── ОБРАБОТЧИК ТЕКСТА (сообщения от пользователя) ──
-@subscription_required
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    text = update.message.text.strip()
-    step = context.user_data.get("step")
-
-    # -----------------------------------------------------------------
-    # 1️⃣ Если профиля нет и step == None → пользователь нажал кнопку меню
-    # -----------------------------------------------------------------
-    if not has_profile(user.id) and step is None:
-        await update.message.reply_text(
-            "❗ Сначала нужно создать анкету. Нажмите «🔄 Обновить анкету» в главном меню.",
-            reply_markup=main_keyboard()
-        )
-        return
-
-    # -----------------------------------------------------------------
-    # 2️⃣ Обработка пошагового создания профиля
-    # -----------------------------------------------------------------
-    if step == "choose_method":
-        if text.isdigit() and len(text) > 5:
-            result = verify_user_steam(user.id, text)
-            if isinstance(result, int):
-                context.user_data["hours"] = result
-                await update.message.reply_text(
-                    f"✅ Получено {result} часов из Steam.\nУкажите ваш возраст:",
-                )
-                context.user_data["step"] = "age"
-            else:
-                await update.message.reply_text(
-                    "⚠️ Не удалось получить часы из Steam. Введите их вручную:",
-                )
-                context.user_data["step"] = "hours_manual"
-        else:
-            await update.message.reply_text(
-                "Введите ваш Steam-ID (цифры) или нажмите кнопку «✍️ Ввести часы вручную».",
-                reply_markup=steam_keyboard()
-            )
-        return
-
-    if step == "hours_manual":
-        try:
-            hours = int(text)
-            if not validate_hours(hours):
-                raise ValueError
-            context.user_data["hours"] = hours
-            await update.message.reply_text("📅 Укажите ваш возраст:")
-            context.user_data["step"] = "age"
-        except ValueError:
-            await update.message.reply_text("Введите корректное число от 0 до 20000.")
-        return
-
-    if step == "age":
-        try:
-            age = int(text)
-            if not validate_age(age):
-                raise ValueError
-            context.user_data["age"] = age
-            await update.message.reply_text("💬 Напишите немного о себе:")
-            context.user_data["step"] = "bio"
-        except ValueError:
-            await update.message.reply_text("Возраст – число от 10 до 100.")
-        return
-
-    if step == "bio":
-        if not validate_bio(text):
-            await update.message.reply_text("Текст должен быть от 5 до 500 символов.")
-            return
-        context.user_data["bio"] = text
-        save_user(
-            user.id,
-            user.first_name,
-            context.user_data["hours"],
-            context.user_data["age"],
-            context.user_data["bio"],
-            user.username,
-        )
-        await update.message.reply_text(
-            "✅ Профиль сохранён! Теперь можно искать напарников.",
-            reply_markup=main_keyboard(),
-        )
-        context.user_data.clear()
-        return
-
-    # -----------------------------------------------------------------
-    # 3️⃣ Обработка кнопок меню (после создания профиля)
-    # -----------------------------------------------------------------
-    if has_profile(user.id):
-        if text == "🔍 Найти напарника":
-            await find_partner(update, context)
-        elif text == "🔄 Обновить анкету":
-            await start_profile(update, context)
-        elif text == "👤 Профиль":
-            await profile_command(update, context)
-        elif text == "📊 Статистика":
-            await stats_command(update, context)
-        elif text == "❤️ Посмотреть лайки":
-            await show_likes_command(update, context)
-        elif text == "🔕 Скрыть анкету":
-            deactivate_user(user.id)
-            await update.message.reply_text(
-                "❌ Ваша анкета скрыта из поиска.", reply_markup=main_keyboard()
-            )
-        elif text == "⚙️ Админ-панель":
-            if user.id in ADMIN_IDS:
-                await show_admin_panel(update, context)
-            else:
-                await update.message.reply_text("❌ У вас нет прав для этого действия.")
-        else:
-            await update.message.reply_text(
-                "Не понял. Выберите действие из меню.", reply_markup=main_keyboard()
-            )
-
-# ── ОБРАБОТЧИК КНОПОК (CallbackQuery) ──
-@subscription_required
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user = query.from_user
-
-    # Если профиля нет и это не кнопка, связанная с регистрацией → блокируем
-    if not has_profile(user.id):
-        allowed_steps = ["link_steam", "manual_hours", "steam_help", "back_to_hours", "check_subscription"]
-        if data not in allowed_steps:
-            await query.edit_message_text(
-                "❗ Сначала нужно создать анкету. Нажмите «🔄 Обновить анкету» в главном меню.",
-                reply_markup=main_keyboard()
-            )
-            return
-
-    # Обработка кнопок регистрации
-    if data == "link_steam":
-        await query.edit_message_text(
-            "🔗 *Привязка Steam аккаунта*\n\n"
-            "Отправьте ваш Steam-ID (только цифры).\n"
-            "❓ Как найти ID? — нажмите кнопку ниже.",
-            parse_mode="Markdown",
-            reply_markup=steam_help_keyboard()
-        )
-        context.user_data["step"] = "waiting_steam_id"
-        return
-
-    if data == "manual_hours":
-        await query.edit_message_text(
-            "✍️ *Ввод часов вручную*\n\n"
-            "Сколько часов вы играли в Rust?\n"
-            "Введите число от 0 до 20000:",
-            parse_mode="Markdown",
-        )
-        context.user_data["step"] = "hours_manual"
-        return
-
-    if data == "steam_help":
-        await query.edit_message_text(
-            "🎮 *Как найти ваш Steam ID:*\n\n"
-            "1️⃣ Откройте Steam → ваш профиль.\n"
-            "2️⃣ Скопируйте цифры из ссылки:\n"
-            "`https://steamcommunity.com/profiles/76561198000000000`\n"
-            "Ваш ID – числа после */profiles/*.\n\n"
-            "⬅️ Вернуться", 
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_hours")]])
-        )
-        return
-
-    if data == "back_to_hours":
-        await query.edit_message_text(
-            "Сколько часов ты откатал в Rust?",
-            reply_markup=steam_keyboard()
-        )
-        context.user_data["step"] = "choose_method"
-        return
-
-    # Передаём остальные действия в handle_callback (лайки, жалобы и т.д.)
-    await handle_callback(update, context)
-
-# ── ОСНОВНОЙ ОБРАБОТЧИК CALLBACK'ОВ (лайки, жалобы, админ-действия) ──
+    # ── ОСНОВНОЙ ОБРАБОТЧИК CALLBACK'ОВ ──
 @subscription_required
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1229,7 +1213,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reports_command(update, context)
         await query.delete_message()
 
-    # ---------- ПРОВЕРКА ПОДПИСКИ ──
+    # ---------- ПРОВЕРКА ПОДПИСКИ ----------
     elif action == "check_subscription":
         user_id = query.from_user.id
         if await check_subscription(user_id, context):
@@ -1245,7 +1229,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=subscribe_keyboard(),
             )
 
-    # ---------- НАЧАТЬ ПОИСК ЗАНОВО ----------
+    # ---------- ПЕРЕЗАПУСК ПОИСКА ----------
     elif action == "restart_search":
         user_id = query.from_user.id
         original_partners = context.user_data.get("original_partners", [])
@@ -1277,8 +1261,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="Выберите действие:",
             reply_markup=main_keyboard()
         )
-
-# ── АДМИН: СПИСОК ЖАЛОБ ──
+        # ── АДМИН: СПИСОК ЖАЛОБ ──
 @admin_only
 async def reports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reports = get_reports_summary()
@@ -1329,6 +1312,7 @@ async def reports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=markup,
         )
+
 # ── АДМИН: БЛОКИРОВКА/РАЗБЛОКИРОВКА ──
 @admin_only
 async def block_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1358,7 +1342,6 @@ async def unblock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def blocked_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Получаем всех забаненных пользователей
     with Database() as cur:
         cur.execute(
             "SELECT user_id, banned_until FROM temp_bans WHERE banned_until > ?",
@@ -1379,7 +1362,7 @@ async def blocked_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── ОБРАБОТЧИК ОШИБОК ──
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Исключение:", exc_info=context.error)
+    logger.error("Исключение при обработке обновления:", exc_info=context.error)
 
 # ───────────────────────────────────────
 #   ⚠️ ВАЖНО: ДОБАВЛЯЕМ FLASK-СЕРВЕР ДЛЯ RENDER
@@ -1431,9 +1414,8 @@ def main():
 
     # Обработчики текста и кнопок
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_steam_id))  # <-- ОСОБОЕ ВНИМАНИЕ: ДОЛЖЕН ИДТИ ПОСЛЕ handle_text
     app.add_handler(CallbackQueryHandler(handle_button))
-
-    # Inline‑кнопки (лайк, дизлайк, жалоба, ответы, пагинация, админ)
     app.add_handler(CallbackQueryHandler(handle_callback, pattern="^(like|dislike|respond|report|activate_profile|deactivate_profile|check_subscription|restart_search|main_menu|admin_.*)"))
     app.add_handler(CallbackQueryHandler(pagination_callback, pattern="^(prev|next)_"))
 
@@ -1445,3 +1427,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+        
