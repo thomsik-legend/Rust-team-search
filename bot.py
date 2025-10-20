@@ -1376,11 +1376,10 @@ def home():
 def run():
     port = int(os.getenv("PORT", 8080))
     flask_app.run(host='0.0.0.0', port=port)
-
 # ───────────────────────────────────────
 #   ЗАПУСК БОТА
 # ───────────────────────────────────────
-def main():
+async def main_async():
     init_db()
     TOKEN = os.getenv("TELEGRAM_TOKEN")
     if not TOKEN:
@@ -1398,9 +1397,15 @@ def main():
 
     # Добавляем задержку, чтобы избежать конфликта с предыдущим экземпляром
     logger.info("⏳ Ожидание 10 секунд перед запуском бота...")
-    time.sleep(10)
+    await asyncio.sleep(10)
 
     app = ApplicationBuilder().token(TOKEN).build()
+
+    # --- ВАЖНОЕ ИЗМЕНЕНИЕ ---
+    # Удаляем вебхук перед запуском polling'а
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("🧹 Вебхук удалён. Запускаем polling...")
+    # -------------------------
 
     # Основные команды
     app.add_handler(CommandHandler("start", start))
@@ -1414,7 +1419,7 @@ def main():
 
     # Обработчики текста и кнопок
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_steam_id))  # <-- ОСОБОЕ ВНИМАНИЕ: ДОЛЖЕН ИДТИ ПОСЛЕ handle_text
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_steam_id))
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(CallbackQueryHandler(handle_callback, pattern="^(like|dislike|respond|report|activate_profile|deactivate_profile|check_subscription|restart_search|main_menu|admin_.*)"))
     app.add_handler(CallbackQueryHandler(pagination_callback, pattern="^(prev|next)_"))
@@ -1423,8 +1428,11 @@ def main():
     app.add_error_handler(error_handler)
 
     logger.info("✅ Бот запущен!")
-    app.run_polling()
+    await app.run_polling()
+
+def main():
+    import asyncio
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
-        
